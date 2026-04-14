@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghostwire"
+version = "0.1.0"
+description = "GHOSTWIRE — Network Forensics Engine. The wire remembers everything."
+readme = "SPEC.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Raphael Main"},
+    {name = "Agent Mackenzie"},
+]
+keywords = ["network", "forensics", "pcap", "c2", "beacon", "detection", "cybersecurity", "ja4", "tls"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "scapy>=2.6",
+    "dpkt>=1.9.8",
+    "ja4plus>=0.4",
+    "numpy>=2.0",
+    "scipy>=1.14",
+    "maxminddb>=2.0",
+    "rich>=13.0",
+    "click>=8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+]
+
+[project.scripts]
+ghostwire = "engine.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["engine*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

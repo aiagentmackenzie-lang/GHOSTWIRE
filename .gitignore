@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.pcap
+*.pcapng
+.env
+.DS_Store
+node_modules/
