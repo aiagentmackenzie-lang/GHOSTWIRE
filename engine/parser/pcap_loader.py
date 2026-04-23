@@ -58,16 +58,24 @@ def _mac_to_str(mac_bytes: bytes) -> str:
 
 
 def _parse_with_dpkt(filepath: Path) -> list[PacketRecord]:
-    """Parse PCAP using dpkt — fast path."""
+    """Parse PCAP using dpkt — fast path.
+
+    Raises ValueError if the file cannot be parsed as a valid PCAP/PCAPNG.
+    """
     packets: list[PacketRecord] = []
 
     with open(filepath, "rb") as f:
         try:
             pcap = dpkt.pcap.Reader(f)
-        except dpkt.dpkt.NeedData:
-            # Try ngpcap
+        except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError):
+            # Try PCAPNG format
             f.seek(0)
-            pcap = dpkt.pcapng.Reader(f)
+            try:
+                pcap = dpkt.pcapng.Reader(f)
+            except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError, ValueError) as e:
+                raise ValueError(
+                    f"File is not a valid PCAP/PCAPNG: {filepath.name}"
+                ) from e
 
         for idx, (ts, buf) in enumerate(pcap):
             try:
@@ -190,12 +198,35 @@ def load_pcap(filepath: str | Path, *, parser: str = "auto") -> list[PacketRecor
     if parser == "auto":
         parser = "dpkt" if _USE_DPKT else "scapy"
 
-    if parser == "dpkt" and _USE_DPKT:
-        packets = _parse_with_dpkt(path)
-    elif parser == "scapy":
-        packets = _parse_with_scapy(path)
-    else:
-        packets = _parse_with_scapy(path)
+    last_error = None
 
-    logger.info(f"Loaded {len(packets)} packets")
-    return packets
+    # Try requested parser; on failure, fall back to the other one
+    parsers_to_try = []
+    if parser == "dpkt" and _USE_DPKT:
+        parsers_to_try = ["dpkt", "scapy"]
+    elif parser == "scapy":
+        parsers_to_try = ["scapy"]
+    else:
+        # dpkt requested but not available — use scapy
+        parsers_to_try = ["scapy"]
+
+    for p in parsers_to_try:
+        try:
+            if p == "dpkt":
+                packets = _parse_with_dpkt(path)
+            else:
+                packets = _parse_with_scapy(path)
+            logger.info(f"Loaded {len(packets)} packets (parser={p})")
+            return packets
+        except ValueError:
+            # dpkt couldn't parse — try scapy fallback
+            last_error = f"File is not a valid capture: {path.name}"
+            logger.debug(f"Parser {p} failed, trying next fallback")
+            continue
+        except Exception as e:
+            last_error = str(e)
+            logger.debug(f"Parser {p} failed with {e}, trying next fallback")
+            continue
+
+    # All parsers failed
+    raise ValueError(last_error or f"Failed to parse capture file: {path.name}")

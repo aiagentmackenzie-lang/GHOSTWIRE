@@ -278,12 +278,10 @@ GHOSTWIRE/
 │   ├── detection/             # Threat detection
 │   │   ├── beacon.py          # C2 beacon detector
 │   │   ├── dns_threats.py    # DNS anomaly detection
-│   │   ├── entropy.py         # Shannon entropy calculator
-│   │   └── scorer.py          # Composite threat scoring
-│   ├── recon/                 # Session reconstruction
-│   │   ├── tcp_stream.py     # TCP reassembly
-│   │   ├── http_recon.py     # HTTP content extraction
-│   │   └── file_extract.py   # Transmitted file extraction
+│   │   ├── scorer.py          # Composite threat scoring
+│   │   └── hunt.py            # Built-in hunt queries
+│   ├── recon/                 # Recon package (placeholder)
+│   │   └── __init__.py         # Session reconstruction is in parser/session.py
 │   ├── export/                # Report generation
 │   │   ├── stix.py            # STIX 2.1 IOC export
 │   │   ├── report.py         # Markdown/PDF reports
@@ -297,9 +295,9 @@ GHOSTWIRE/
 │   │   │   ├── Timeline.tsx       # Session timeline
 │   │   │   ├── BeaconChart.tsx   # C2 beacon visualization
 │   │   │   ├── NetworkGraph.tsx  # Connection graph
-│   │   │   ├── GeoMap.tsx        # IP geolocation map
 │   │   │   ├── SessionView.tsx   # TCP stream inspector
-│   │   │   ├── HuntNotebook.tsx  # Interactive hunting
+│   │   │   ├── ProtoBreakdown.tsx # Protocol distribution
+│   │   │   ├── FingerprintTable.tsx # JA4/JA3 fingerprint list
 │   │   │   └── ThreatPanel.tsx   # Threat summary cards
 │   │   ├── hooks/
 │   │   │   └── useWebSocket.ts

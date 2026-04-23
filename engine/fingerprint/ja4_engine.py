@@ -136,17 +136,26 @@ def fingerprint_tls(payload: bytes, *, src_ip: str = "", dst_ip: str = "",
     # Try ja4plus first
     if _HAS_JA4PLUS:
         try:
-            result = ja4plus.fingerprint_tls(payload)
+            # ja4plus API: generate_ja4(payload_bytes) -> JA4Fingerprinter result
+            result = ja4plus.generate_ja4(payload)
             if result:
-                if hasattr(result, "ja4"):
-                    fp.ja4 = result.ja4 or ""
-                if hasattr(result, "ja4s"):
-                    fp.ja4s = result.ja4s or ""
-                fp.is_client_hello = getattr(result, "is_client_hello", False)
-                fp.is_server_hello = getattr(result, "is_server_hello", False)
-                return fp
+                fp.ja4 = getattr(result, 'ja4', '') or getattr(result, 'hash', '') or str(result)
+                fp.is_client_hello = True  # generate_ja4 only works on Client Hello
+                if fp.ja4:
+                    return fp
         except Exception as e:
-            logger.debug(f"ja4plus failed, falling back: {e}")
+            logger.debug(f"ja4plus generate_ja4 failed, falling back: {e}")
+
+        try:
+            # Try JA4S for server hello
+            result = ja4plus.generate_ja4s(payload)
+            if result:
+                fp.ja4s = getattr(result, 'ja4s', '') or getattr(result, 'hash', '') or str(result)
+                fp.is_server_hello = True
+                if fp.ja4s:
+                    return fp
+        except Exception as e:
+            logger.debug(f"ja4plus generate_ja4s failed: {e}")
 
     # Fallback: manual extraction
     if len(payload) > 5:

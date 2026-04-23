@@ -22,6 +22,8 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.progress import Progress
 
+from scapy.all import Scapy_Exception
+
 from engine import __version__
 from engine.parser.pcap_loader import load_pcap
 from engine.parser.protocol import identify_protocol
@@ -153,7 +155,15 @@ def analyze(pcap_file: str, output: str, parser: str, min_score: float, min_pack
     """Analyze a PCAP file for threats, C2 beacons, and fingerprints."""
 
     start_time = time.time()
-    results = _full_analysis(pcap_file, parser=parser, min_packets=min_packets)
+    try:
+        results = _full_analysis(pcap_file, parser=parser, min_packets=min_packets)
+    except (ValueError, Scapy_Exception) as exc:
+        console.print(f"[red]✗ Parse error:[/] {exc}")
+        console.print("[dim]The file may be corrupt or not a valid PCAP/PCAPNG capture.[/]")
+        sys.exit(1)
+    except FileNotFoundError as exc:
+        console.print(f"[red]✗ File not found:[/] {exc}")
+        sys.exit(1)
     elapsed = time.time() - start_time
 
     # Filter threats by min_score
@@ -190,7 +200,15 @@ def analyze(pcap_file: str, output: str, parser: str, min_score: float, min_pack
 def hunt(pcap_file: str, query: Optional[str], run_all: bool, output: str):
     """Hunt for threats using predefined queries."""
 
-    packets = load_pcap(pcap_file)
+    try:
+        packets = load_pcap(pcap_file)
+    except (ValueError, Scapy_Exception) as exc:
+        console.print(f"[red]✗ Parse error:[/] {exc}")
+        console.print("[dim]The file may be corrupt or not a valid PCAP/PCAPNG capture.[/]")
+        sys.exit(1)
+    except FileNotFoundError as exc:
+        console.print(f"[red]✗ File not found:[/] {exc}")
+        sys.exit(1)
 
     # Protocol identification
     for pkt in packets:
@@ -245,7 +263,15 @@ def hunt(pcap_file: str, query: Optional[str], run_all: bool, output: str):
 def report(pcap_file: str, fmt: str, output_file: Optional[str], min_score: float):
     """Generate threat analysis report."""
 
-    results = _full_analysis(pcap_file)
+    try:
+        results = _full_analysis(pcap_file)
+    except (ValueError, Scapy_Exception) as exc:
+        console.print(f"[red]✗ Parse error:[/] {exc}")
+        console.print("[dim]The file may be corrupt or not a valid PCAP/PCAPNG capture.[/]")
+        sys.exit(1)
+    except FileNotFoundError as exc:
+        console.print(f"[red]✗ File not found:[/] {exc}")
+        sys.exit(1)
 
     analysis = {
         "ghostwire_version": __version__,

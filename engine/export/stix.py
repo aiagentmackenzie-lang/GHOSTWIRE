@@ -178,25 +178,47 @@ def export_stix(bundle: dict, filepath: str) -> None:
 
 
 def iocs_from_analysis(analysis: dict) -> list[dict]:
-    """Convert GHOSTWIRE analysis results into IOC dicts for STIX export."""
+    """Convert GHOSTWIRE analysis results into IOC dicts for STIX export.
+
+    Uses session metadata (src_ip, dst_ip) directly instead of parsing
+    session_id strings. Falls back to session_id parsing only when the
+    structured fields are not available.
+    """
     iocs: list[dict] = []
 
     for threat in analysis.get("threats", []):
         target = threat.get("target", "")
+        overall_score = threat.get("overall_score", 0)
+        mitre_techniques = threat.get("mitre_techniques", [])
+        summary = threat.get("summary", "")
 
-        # Extract IPs from session target
-        parts = target.split("-")
-        for part in parts:
-            ip_port = part.split(":")
-            if len(ip_port) >= 1 and _looks_like_ip(ip_port[0]):
+        # --- Extract IPs from structured session fields ---
+        # Prefer src_ip / dst_ip if present (added by enriched threat scores)
+        for ip_field in ("src_ip", "dst_ip"):
+            ip_val = threat.get(ip_field, "")
+            if ip_val and _looks_like_ip(ip_val):
                 iocs.append({
                     "type": "ipv4-addr",
-                    "value": ip_port[0],
-                    "confidence": threat.get("overall_score", 0),
+                    "value": ip_val,
+                    "confidence": overall_score,
                     "threat_type": "c2_communication",
-                    "mitre_techniques": threat.get("mitre_techniques", []),
-                    "description": threat.get("summary", ""),
+                    "mitre_techniques": mitre_techniques,
+                    "description": summary,
                 })
+
+        # Fallback: parse target string (e.g. "10.0.0.1:443-192.168.1.1:50000")
+        if not threat.get("src_ip") and not threat.get("dst_ip") and target:
+            for segment in target.split("-"):
+                ip_part = segment.split(":")[0]
+                if _looks_like_ip(ip_part):
+                    iocs.append({
+                        "type": "ipv4-addr",
+                        "value": ip_part,
+                        "confidence": overall_score,
+                        "threat_type": "c2_communication",
+                        "mitre_techniques": mitre_techniques,
+                        "description": summary,
+                    })
 
         # Extract domains from DNS threats
         for dns in threat.get("dns_threats", []):
@@ -207,7 +229,7 @@ def iocs_from_analysis(analysis: dict) -> list[dict]:
                     "value": domain,
                     "confidence": dns.get("score", 0),
                     "threat_type": dns.get("threat_type", "dns_threat"),
-                    "mitre_techniques": threat.get("mitre_techniques", []),
+                    "mitre_techniques": mitre_techniques,
                     "description": f"DNS {dns.get('threat_type', 'threat')}: {domain}",
                 })
 

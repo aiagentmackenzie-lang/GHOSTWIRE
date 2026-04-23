@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "ghostwire"
 version = "0.1.0"
 description = "GHOSTWIRE — Network Forensics Engine. The wire remembers everything."
-readme = "SPEC.md"
+readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [

@@ -2,19 +2,75 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { spawn } from 'child_process';
 import path from 'path';
+import fs from 'fs';
 
 const app = Fastify({ logger: false });
 
 app.register(cors, { origin: true });
 
+// Health check endpoint
+app.get('/health', async () => ({ status: 'ok', version: '0.1.0' }));
+
 // Store analysis results in memory (simple approach for now)
 let currentAnalysis: any = null;
+
+// ─── Auth middleware ────────────────────────────────────────────
+// If GHOSTWIRE_API_KEY is set, require Authorization: Bearer <key>
+// If unset, the API is open (local-dev mode only).
+const API_KEY = process.env.GHOSTWIRE_API_KEY || null;
+
+app.addHook('onRequest', async (request: any, reply: any) => {
+  // Skip auth for WebSocket upgrade and health checks
+  if (request.url === '/ws' || request.url === '/health') return;
+
+  if (API_KEY) {
+    const auth = request.headers['authorization'];
+    if (!auth || auth !== `Bearer ${API_KEY}`) {
+      return reply.code(401).send({ error: 'Unauthorized. Set Authorization: Bearer <key>' });
+    }
+  }
+});
+
+// ─── Path validation ──────────────────────────────────────────
+const ALLOWED_EXTENSIONS = ['.pcap', '.pcapng', '.cap'];
+
+function validateFilePath(filePath: string): string | null {
+  // Resolve to absolute path and reject traversal
+  const resolved = path.resolve(filePath);
+
+  // Block path traversal components
+  if (filePath.includes('..')) {
+    return 'Path traversal rejected';
+  }
+
+  // Must be an absolute path or relative without traversal
+  // Restrict to allowed extensions
+  const ext = path.extname(resolved).toLowerCase();
+  if (!ALLOWED_EXTENSIONS.includes(ext)) {
+    return `Unsupported file extension: ${ext}. Allowed: ${ALLOWED_EXTENSIONS.join(', ')}`;
+  }
+
+  // File must exist and be readable
+  try {
+    fs.accessSync(resolved, fs.constants.R_OK);
+  } catch {
+    return `File not found or unreadable: ${resolved}`;
+  }
+
+  return null; // valid
+}
 
 app.post('/api/analyze', async (request: any, reply: any) => {
   const { filePath, parser = 'auto', minScore = 0.1, minPackets = 5 } = request.body;
 
   if (!filePath) {
     return reply.code(400).send({ error: 'filePath is required' });
+  }
+
+  // Validate file path (no traversal, correct extension, exists)
+  const pathError = validateFilePath(filePath);
+  if (pathError) {
+    return reply.code(400).send({ error: pathError });
   }
 
   // Run ghostwire CLI and capture JSON output
@@ -29,6 +85,10 @@ app.post('/api/analyze', async (request: any, reply: any) => {
       '--parser', parser,
     ];
 
+    // ⚠ Security note: PYTHONPATH is overridden so the Python subprocess
+    // can import the engine package from the project root. This is safe for
+    // local development but the server MUST NOT be exposed publicly without
+    // auth (GHOSTWIRE_API_KEY) and proper network isolation.
     const proc = spawn(venv, args, {
       cwd: path.join(__dirname, '..'),
       env: { ...process.env, PYTHONPATH: path.join(__dirname, '..') },
@@ -42,7 +102,9 @@ app.post('/api/analyze', async (request: any, reply: any) => {
 
     proc.on('close', (code: number) => {
       if (code !== 0) {
-        resolve(reply.code(500).send({ error: 'Analysis failed', details: stderr }));
+        // Sanitize: log full stderr server-side, send generic error to client
+        console.error(`[GHOSTWIRE] Analysis failed (exit ${code}): ${stderr}`);
+        resolve(reply.code(500).send({ error: 'Analysis failed. Check server logs for details.' }));
         return;
       }
 
@@ -50,7 +112,7 @@ app.post('/api/analyze', async (request: any, reply: any) => {
         currentAnalysis = JSON.parse(stdout);
         resolve(reply.send(currentAnalysis));
       } catch {
-        resolve(reply.code(500).send({ error: 'Failed to parse analysis output', raw: stdout }));
+        resolve(reply.code(500).send({ error: 'Failed to parse analysis output' }));
       }
     });
   });

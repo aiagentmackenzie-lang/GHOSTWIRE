@@ -9,3 +9,10 @@ build/
 .env
 .DS_Store
 node_modules/
+# Generated reports & test artifacts
+*.report.md
+*.report.txt
+*.stix.json
+.coverage
+.pytest_cache/
+htmlcov/

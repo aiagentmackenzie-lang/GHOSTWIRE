@@ -149,7 +149,7 @@ def detect_dns_tunneling(domain: str, query_type: str = "A") -> Optional[DNSThre
     - Very long subdomain labels (data encoded in subdomain)
     - Excessive subdomain depth
     """
-    if not domain:
+    if not domain or domain in (".", "localhost") or domain.endswith(".arpa"):
         return None
 
     threat = DNSThreat(domain=domain, query_type=query_type)

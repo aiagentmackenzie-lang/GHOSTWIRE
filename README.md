@@ -94,15 +94,17 @@ Matches against known C2 tool fingerprints for Cobalt Strike, Sliver, Metasploit
 | JA4+ fingerprinting | ❌ | ❌ | ❌ | ✅ |
 | Single developer built | ❌ | ❌ | ❌ | ✅ |
 | No infrastructure needed | ❌ | ❌ | ❌ | ✅ |
-| PCAP-level analysis | ❌ | ✅ | ✅ | ✅ |
+| PCAP-level analysis | ❌* | ✅ | ✅ | ✅ |
 | DNS threat detection | ❌ | ❌ | ❌ | ✅ |
+
+*RITA analyzes Zeek/Zeek logs (not raw PCAP directly), which is the real differentiator.
 
 ## Roadmap
 
 - [x] Phase 1: PCAP parser + protocol decoder + JA4+ fingerprinting + C2 matching
 - [x] Phase 2: C2 beacon detector + DNS threats + composite scoring
-- [ ] Phase 3: React dashboard (timeline, beacon chart, network graph, geo map)
-- [ ] Phase 4: STIX 2.1 export + MITRE ATT&CK mapping + report generator
+- [x] Phase 3: React dashboard (timeline, beacon chart, network graph, session view, protocol breakdown, fingerprint table)
+- [x] Phase 4: STIX 2.1 export + MITRE ATT&CK mapping + report generator
 
 ## License
 
