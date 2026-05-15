@@ -16,3 +16,4 @@ node_modules/
 .coverage
 .pytest_cache/
 htmlcov/
+BUG_CATALOG.md
