@@ -1,7 +1,6 @@
 """Tests for DNS threat detection (engine/detection/dns_threats.py)."""
 
-import pytest
-from engine.detection.dns_threats import analyze_dns, detect_dga, detect_dns_tunneling
+from engine.detection.dns_threats import analyze_dns
 
 
 class TestDetectDGA:

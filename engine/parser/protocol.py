@@ -166,7 +166,7 @@ def decode_tls(payload: bytes) -> Optional[TLSInfo]:
                             ext_data_len = struct.unpack("!H", payload[offset+2:offset+4])[0]
                             if ext_type == 0x0000 and offset + 9 < len(payload):
                                 # SNI list
-                                sni_list_len = struct.unpack("!H", payload[offset+5:offset+7])[0]
+                                struct.unpack("!H", payload[offset+5:offset+7])[0]
                                 sni_type = payload[offset+7]
                                 sni_len = struct.unpack("!H", payload[offset+8:offset+10])[0]
                                 if sni_type == 0 and offset + 10 + sni_len <= len(payload):

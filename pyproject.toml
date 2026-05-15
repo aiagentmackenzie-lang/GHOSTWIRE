@@ -28,9 +28,6 @@ dependencies = [
     "scapy>=2.6",
     "dpkt>=1.9.8",
     "ja4plus>=0.4",
-    "numpy>=2.0",
-    "scipy>=1.14",
-    "maxminddb>=2.0",
     "rich>=13.0",
     "click>=8.0",
 ]

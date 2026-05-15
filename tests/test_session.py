@@ -1,7 +1,7 @@
 """Tests for TCP session reconstruction (engine/parser/session.py)."""
 
 import pytest
-from engine.parser.session import reconstruct_sessions, TCPSession, _make_session_key
+from engine.parser.session import reconstruct_sessions, _make_session_key
 from engine.parser.pcap_loader import PacketRecord
 
 

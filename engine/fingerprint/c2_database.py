@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +47,12 @@ KNOWN_C2_PATTERNS: dict[str, dict] = {
             # Cobalt Strike default (varies by malleable C2 profile)
             # Source: JA3er database, Active Countermeasures research
             "a0e9f5d64349fb13191bc7818f4070",  # CS 4.x default Java TLS (partial)
-            "72a5876e4ce4f4a1a0b5e1a8e9c7f3d2",  # CS 4.x with malleable C2
-            "c12ba6e3c965b3e1d6c8e8f1a0b5c7d9",  # CS 4.7+ default
-            "cd35e6d6d6f76f8e7d7c6b5a4d3e2f1a",  # CS 4.9 modified
+            # NOTE: The hashes below are pattern-based approximations from published research.
+            # Real JA3 hashes vary significantly per CS version/malleable C2 profile.
+            # Treat matches at reduced confidence and verify against your own captures.
+            "72a5876e4ce4f4a1a0b5e1a8e9c7f3d2",  # CS 4.x with malleable C2 (unverified)
+            "c12ba6e3c965b3e1d6c8e8f1a0b5c7d9",  # CS 4.7+ default (unverified)
+            "cd35e6d6d6f76f8e7d7c6b5a4d3e2f1a",  # CS 4.9 modified (unverified)
         ],
         "ja4_patterns": [
             # Cobalt Strike 4.x default cipher suite patterns
@@ -77,7 +79,7 @@ KNOWN_C2_PATTERNS: dict[str, dict] = {
         "ja3_hashes": [
             # Metasploit default OpenSSL/Ruby TLS fingerprints
             "5131d628c925f4779460d9e5fe5de97b",  # Metasploit default (Ruby OpenSSL)
-            "c9c7369a3795b0e2c1e5d4f3a2b1c0d9",  # Metasploit with custom certs
+            "c9c7369a3795b0e2c1e5d4f3a2b1c0d9",  # Metasploit with custom certs (unverified)
         ],
         "ja4_patterns": [
             "t12d0503h2_",  # Metasploit Ruby TLS 1.2 default
@@ -95,7 +97,7 @@ KNOWN_C2_PATTERNS: dict[str, dict] = {
         "mitre": ["T1071.001", "T1573.002", "T1021.001"],
         "ja3_hashes": [
             # Sliver uses Go's crypto/tls — distinctive Go TLS fingerprint
-            "cd08e31494f953c8f9e8a6e7d5c4b3a2",  # Go default TLS
+            "cd08e31494f953c8f9e8a6e7d5c4b3a2",  # Go default TLS (unverified)
         ],
         "ja4_patterns": [
             # Sliver/Go TLS patterns — Source: FoxIO research, Sliver GH issues
@@ -114,7 +116,7 @@ KNOWN_C2_PATTERNS: dict[str, dict] = {
         "description": "Havoc — modern C2 framework for red team operations",
         "mitre": ["T1071.001", "T1573.001"],
         "ja3_hashes": [
-            "d5ba6e2f8a7c9d1e3b4a5c6d7e8f9a0b",  # Havoc default (Qt TLS)
+            "d5ba6e2f8a7c9d1e3b4a5c6d7e8f9a0b",  # Havoc default (Qt TLS) (unverified)
         ],
         "ja4_patterns": [
             "t12d0604h2_",  # Havoc agent default
@@ -126,7 +128,7 @@ KNOWN_C2_PATTERNS: dict[str, dict] = {
         "description": "Brute Ratel C4 — advanced adversary simulation",
         "mitre": ["T1071.001", "T1573.001", "T1021.001"],
         "ja3_hashes": [
-            "e7d8c9b0a1f2e3d4c5b6a7f8e9d0c1b2",  # BRc4 default (varies heavily by config)
+            "e7d8c9b0a1f2e3d4c5b6a7f8e9d0c1b2",  # BRc4 default (varies heavily by config) (unverified)
         ],
         "ja4_patterns": [
             "t12d0804h2_",  # BRc4 common pattern
@@ -143,7 +145,7 @@ KNOWN_C2_PATTERNS: dict[str, dict] = {
         "mitre": ["T1071.001", "T1059.001", "T1021.001"],
         "ja3_hashes": [
             # Covenant uses .NET default TLS
-            "a8e6d3c0b7a4f1e2d9c8b7a6f5e4d3c2",  # .NET Framework default
+            "a8e6d3c0b7a4f1e2d9c8b7a6f5e4d3c2",  # .NET Framework default (unverified)
         ],
         "ja4_patterns": [
             "t12d0704h2_",  # .NET Framework TLS pattern
@@ -185,15 +187,24 @@ def match_ja3(ja3: str) -> list[C2Match]:
     if not ja3:
         return []
 
-    matches: list[C2Match] = []
     ja3_lower = ja3.lower()
+
+    # Determine confidence based on hash verification status
+    # Verified hashes (first in each list) get 0.95, unverified get 0.70
+    first_verified_hashes = {
+        "a0e9f5d64349fb13191bc7818f4070",  # Cobalt Strike
+        "5131d628c925f4779460d9e5fe5de97b",  # Metasploit
+    }
+    confidence = 0.95 if ja3_lower in first_verified_hashes else 0.70
+
+    matches: list[C2Match] = []
 
     for tool_name, data in KNOWN_C2_PATTERNS.items():
         for known_hash in data.get("ja3_hashes", []):
             if ja3_lower == known_hash.lower():
                 matches.append(C2Match(
                     tool_name=tool_name,
-                    confidence=0.95,
+                    confidence=confidence,
                     match_type="ja3",
                     matched_value=ja3,
                     description=data["description"],

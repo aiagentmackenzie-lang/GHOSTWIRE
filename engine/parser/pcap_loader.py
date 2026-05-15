@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import BinaryIO
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +17,7 @@ except ImportError:
     logger.warning("dpkt not installed, falling back to scapy (slower for large files)")
 
 try:
-    from scapy.all import rdpcap, IP as ScapyIP, TCP as ScapyTCP, UDP as ScapyUDP, ICMP as ScapyICMP, Raw
+    from scapy.all import rdpcap, IP as ScapyIP, TCP as ScapyTCP, UDP as ScapyUDP, ICMP as ScapyICMP
 except ImportError:
     pass  # Will fail at runtime if neither available
 
@@ -43,7 +41,14 @@ class PacketRecord:
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        d["raw_payload"] = self.raw_payload.hex() if self.raw_payload else ""
+        # Truncate raw_payload hex to prevent enormous JSON output
+        if self.raw_payload:
+            d["raw_payload"] = self.raw_payload[:512].hex()
+            if len(self.raw_payload) > 512:
+                d["payload_truncated"] = True
+                d["original_payload_size"] = len(self.raw_payload)
+        else:
+            d["raw_payload"] = ""
         return d
 
 
@@ -165,6 +170,10 @@ def _parse_with_scapy(filepath: Path) -> list[PacketRecord]:
 
             elif pkt.haslayer(ScapyICMP):
                 record.protocol_l4 = "ICMP"
+                icmp = pkt[ScapyICMP]
+                record.metadata["icmp_type"] = icmp.type
+                record.metadata["icmp_code"] = icmp.code
+                record.raw_payload = bytes(icmp.payload) if icmp.payload else b""
 
         packets.append(record)
 

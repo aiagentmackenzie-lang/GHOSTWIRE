@@ -1,9 +1,7 @@
 """Tests for protocol identification (engine/parser/protocol.py)."""
 
-import pytest
 from engine.parser.protocol import (
-    identify_protocol, decode_tls, decode_dns, decode_http, decode_ssh,
-    decode_icmp, ProtocolResult,
+    identify_protocol, decode_http,
 )
 
 
@@ -86,7 +84,6 @@ class TestIdentifyProtocol:
     def test_icmp_high_entropy_tunnel_suspect(self):
         """ICMP with high-entropy payload should flag tunnel_suspect."""
         # High entropy data (near-random bytes)
-        import struct
         high_entropy = bytes(range(256)) * 16  # 4096 bytes of distributed values
         result = identify_protocol(0, 0, high_entropy, l4_protocol="ICMP",
                                    metadata={"icmp_type": 8, "icmp_code": 0})

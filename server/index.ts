@@ -20,8 +20,22 @@ let currentAnalysis: any = null;
 const API_KEY = process.env.GHOSTWIRE_API_KEY || null;
 
 app.addHook('onRequest', async (request: any, reply: any) => {
-  // Skip auth for WebSocket upgrade and health checks
-  if (request.url === '/ws' || request.url === '/health') return;
+  // Skip auth for health checks
+  if (request.url === '/health') return;
+
+  // WebSocket auth: validate query param or origin
+  if (request.url === '/ws') {
+    if (API_KEY) {
+      // For WebSocket, accept token from query param or Authorization header
+      const url = new URL(request.url, `http://${request.headers.host}`);
+      const wsToken = url.searchParams.get('token');
+      const auth = request.headers['authorization'];
+      if (wsToken !== API_KEY && auth !== `Bearer ${API_KEY}`) {
+        return reply.code(401).send({ error: 'Unauthorized. Provide ?token=<key> or Authorization header.' });
+      }
+    }
+    return;
+  }
 
   if (API_KEY) {
     const auth = request.headers['authorization'];
@@ -34,6 +48,13 @@ app.addHook('onRequest', async (request: any, reply: any) => {
 // ─── Path validation ──────────────────────────────────────────
 const ALLOWED_EXTENSIONS = ['.pcap', '.pcapng', '.cap'];
 
+// Allowed directories for PCAP files (configurable via env)
+// Defaults to project root's samples/ directory
+const ALLOWED_DIRS = (process.env.GHOSTWIRE_ALLOWED_DIRS || '')
+    .split(':')
+    .filter(Boolean)
+    .map(d => path.resolve(d));
+
 function validateFilePath(filePath: string): string | null {
   // Resolve to absolute path and reject traversal
   const resolved = path.resolve(filePath);
@@ -43,7 +64,14 @@ function validateFilePath(filePath: string): string | null {
     return 'Path traversal rejected';
   }
 
-  // Must be an absolute path or relative without traversal
+  // If ALLOWED_DIRS is configured, restrict to those directories
+  if (ALLOWED_DIRS.length > 0) {
+    const allowed = ALLOWED_DIRS.some(dir => resolved.startsWith(dir + path.sep) || resolved === dir);
+    if (!allowed) {
+      return `Access denied: file outside allowed directories`;
+    }
+  }
+
   // Restrict to allowed extensions
   const ext = path.extname(resolved).toLowerCase();
   if (!ALLOWED_EXTENSIONS.includes(ext)) {

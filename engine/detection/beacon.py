@@ -63,10 +63,11 @@ def _mean(values: list[float]) -> float:
 
 
 def _std(values: list[float]) -> float:
+    """Sample standard deviation (Bessel's correction)."""
     if len(values) < 2:
         return 0.0
     m = _mean(values)
-    return math.sqrt(sum((x - m) ** 2 for x in values) / len(values))
+    return math.sqrt(sum((x - m) ** 2 for x in values) / (len(values) - 1))
 
 
 def _shannon_entropy(data: bytes) -> float:

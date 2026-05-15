@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
+import math
 import logging
-from typing import Callable, Any
+from typing import Callable
 
 from engine.parser.pcap_loader import PacketRecord
 from engine.parser.session import TCPSession
@@ -55,7 +55,6 @@ def hunt_suspicious_beacons(sessions: list[TCPSession]) -> list[dict]:
         if not s.inter_arrival_times:
             continue
 
-        import math
         iats = [i for i in s.inter_arrival_times if i > 1.0]
         if len(iats) < 3:
             continue
@@ -99,7 +98,7 @@ def hunt_cobalt_strike(sessions: list[TCPSession], packets: list[PacketRecord]) 
                     "source": f"{pkt.src_ip}:{pkt.src_port}",
                     "destination": f"{pkt.dst_ip}:{pkt.dst_port}",
                     "user_agent": ua,
-                    "reason": f"Cobalt Strike default User-Agent detected",
+                    "reason": "Cobalt Strike default User-Agent detected",
                 })
 
     # Check for CS default beacon interval (60s)
@@ -114,7 +113,7 @@ def hunt_cobalt_strike(sessions: list[TCPSession], packets: list[PacketRecord]) 
             results.append({
                 "session_id": s.session_id,
                 "interval": round(mean, 1),
-                "reason": f"~60s beacon interval (Cobalt Strike default)",
+                "reason": "~60s beacon interval (Cobalt Strike default)",
             })
 
     return results
@@ -148,7 +147,6 @@ def hunt_dns_tunneling(packets: list[PacketRecord]) -> list[dict]:
         if domain:
             first_label = domain.split(".")[0]
             if len(first_label) > 20:
-                import math
                 freq: dict[str, int] = {}
                 for c in first_label.lower():
                     freq[c] = freq.get(c, 0) + 1
@@ -184,18 +182,38 @@ def hunt_data_exfil(sessions: list[TCPSession]) -> list[dict]:
     return results
 
 
+def _is_private_ip(ip: str) -> bool:
+    """Check if an IP address is RFC 1918 private, link-local, or loopback."""
+    if ip.startswith("10."):
+        return True
+    if ip.startswith("172."):
+        # 172.16.0.0/12 — 172.16.x.x through 172.31.x.x
+        parts = ip.split(".")
+        if len(parts) == 4:
+            try:
+                second = int(parts[1])
+                if 16 <= second <= 31:
+                    return True
+            except ValueError:
+                pass
+    if ip.startswith("192.168."):
+        return True
+    if ip.startswith("127."):
+        return True  # loopback
+    if ip.startswith("169.254."):
+        return True  # link-local
+    return False
+
+
+suspicious_ports = {22, 23, 445, 3389, 5985, 5986, 513, 514, 25}
+
+
 def hunt_lateral_movement(sessions: list[TCPSession]) -> list[dict]:
     """Find internal-to-internal connections on suspicious ports."""
-    suspicious_ports = {22, 23, 445, 3389, 5985, 5986, 513, 514, 25}
-    private_prefixes = ("10.", "172.16.", "172.17.", "172.18.", "172.19.",
-                        "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
-                        "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
-                        "172.30.", "172.31.", "192.168.")
-
     results = []
     for s in sessions:
-        src_private = any(s.src_ip.startswith(p) for p in private_prefixes)
-        dst_private = any(s.dst_ip.startswith(p) for p in private_prefixes)
+        src_private = _is_private_ip(s.src_ip)
+        dst_private = _is_private_ip(s.dst_ip)
 
         if src_private and dst_private:
             if s.dst_port in suspicious_ports or s.src_port in suspicious_ports:
@@ -212,18 +230,16 @@ def hunt_lateral_movement(sessions: list[TCPSession]) -> list[dict]:
 
 def hunt_encrypted_c2(sessions: list[TCPSession]) -> list[dict]:
     """Find TLS sessions to external IPs with high-entropy payloads."""
-    private_prefixes = ("10.", "172.16.", "192.168.")
     results = []
 
     for s in sessions:
-        dst_external = not any(s.dst_ip.startswith(p) for p in private_prefixes)
+        dst_external = not _is_private_ip(s.dst_ip)
         if not dst_external:
             continue
         if s.protocol_l7 != "TLS" and s.dst_port not in (443, 8443):
             continue
 
         # Check payload entropy
-        import math
         payload = s.client_payload[:4096] + s.server_payload[:4096]
         if not payload:
             continue

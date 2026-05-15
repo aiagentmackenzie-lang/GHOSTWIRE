@@ -20,7 +20,6 @@ import click
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from rich.progress import Progress
 
 from scapy.all import Scapy_Exception
 
@@ -33,10 +32,10 @@ from engine.fingerprint.ja4h_engine import fingerprint_stream as http_fingerprin
 from engine.fingerprint.ja4ssh_engine import fingerprint_stream as ssh_fingerprint
 from engine.fingerprint.c2_database import match_all
 from engine.detection.beacon import detect_beacons
-from engine.detection.dns_threats import analyze_dns
+from engine.detection.dns_threats import analyze_dns, DNSThreat
 from engine.detection.scorer import score_session
 from engine.detection.hunt import BUILTIN_QUERIES, run_hunt, run_all_hunts
-from engine.export.stix import build_stix_bundle, iocs_from_analysis, export_stix
+from engine.export.stix import build_stix_bundle, iocs_from_analysis
 from engine.export.report import generate_markdown_report, generate_text_report, save_report
 from engine.export.mitre_map import map_analysis_to_attack
 
@@ -77,26 +76,29 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
     http_fps = http_fingerprint(packets)
     ssh_fps = ssh_fingerprint(packets)
 
-    # C2 matching
+    # C2 matching — check both source and destination directions
     all_c2_matches: dict[str, list] = {}
     for fp in tls_fps:
-        key = f"{fp.source_ip}:{fp.source_port}"
-        matches = match_all(ja4=fp.ja4, ja3=fp.ja3_hash)
-        if matches:
-            all_c2_matches.setdefault(key, []).extend(matches)
+        for key in (f"{fp.source_ip}:{fp.source_port}", f"{fp.destination_ip}:{fp.destination_port}"):
+            matches = match_all(ja4=fp.ja4, ja3=fp.ja3_hash)
+            if matches:
+                all_c2_matches.setdefault(key, []).extend(matches)
     for fp in http_fps:
-        matches = match_all(user_agent=fp.user_agent)
-        if matches:
-            all_c2_matches.setdefault(fp.source_ip, []).extend(matches)
+        for key in (fp.source_ip, fp.destination_ip):
+            matches = match_all(user_agent=fp.user_agent)
+            if matches:
+                all_c2_matches.setdefault(key, []).extend(matches)
     for fp in ssh_fps:
-        matches = match_all(ssh_banner=fp.client_banner, ssh_software=fp.client_software)
-        if matches:
-            all_c2_matches.setdefault(fp.source_ip, []).extend(matches)
+        for key in (fp.source_ip, fp.destination_ip):
+            matches = match_all(ssh_banner=fp.client_banner, ssh_software=fp.client_software)
+            if matches:
+                all_c2_matches.setdefault(key, []).extend(matches)
 
     # Beacon detection
     beacons = detect_beacons(sessions, min_packets=min_packets)
 
     # DNS threats
+    dns_threats_objs: list[DNSThreat] = []
     dns_threats_all: list[dict] = []
     for pkt in packets:
         if pkt.protocol_l7 == "DNS" and pkt.metadata.get("protocol_result", {}).get("dns"):
@@ -108,16 +110,20 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
                     dns_info.get("response_code", "NOERROR"),
                 )
                 for t in threats:
+                    dns_threats_objs.append(t)
                     dns_threats_all.append(t.to_dict())
 
     # Composite scoring
     beacon_map = {b.session_id: b for b in beacons}
     threat_scores = []
     for session in sessions:
-        c2 = all_c2_matches.get(f"{session.src_ip}:{session.src_port}", [])
+        c2 = list(all_c2_matches.get(f"{session.src_ip}:{session.src_port}", []))
         c2 += all_c2_matches.get(f"{session.dst_ip}:{session.dst_port}", [])
+        c2 += all_c2_matches.get(session.src_ip, [])
+        c2 += all_c2_matches.get(session.dst_ip, [])
+        # Include DNS threats in composite scoring
         beacon = beacon_map.get(session.session_id)
-        score = score_session(session.session_id, beacon=beacon, c2_matches=c2)
+        score = score_session(session.session_id, beacon=beacon, c2_matches=c2, dns_threats=dns_threats_objs)
         threat_scores.append(score)
 
     return {
@@ -259,12 +265,15 @@ def hunt(pcap_file: str, query: Optional[str], run_all: bool, output: str):
 @click.option("--format", "-f", "fmt", type=click.Choice(["markdown", "text", "stix"]), default="markdown",
               help="Report format")
 @click.option("--output-file", "-o", type=click.Path(), help="Output file path")
-@click.option("--min-score", type=float, default=0.25)
-def report(pcap_file: str, fmt: str, output_file: Optional[str], min_score: float):
+@click.option("--min-score", type=float, default=0.25,
+              help="Minimum threat score to report (0.0-1.0)")
+@click.option("--min-packets", type=int, default=10,
+              help="Minimum packets per session for beacon analysis")
+def report(pcap_file: str, fmt: str, output_file: Optional[str], min_score: float, min_packets: int):
     """Generate threat analysis report."""
 
     try:
-        results = _full_analysis(pcap_file)
+        results = _full_analysis(pcap_file, min_packets=min_packets)
     except (ValueError, Scapy_Exception) as exc:
         console.print(f"[red]✗ Parse error:[/] {exc}")
         console.print("[dim]The file may be corrupt or not a valid PCAP/PCAPNG capture.[/]")
@@ -340,13 +349,15 @@ def _print_rich_summary(pcap_file, results, threat_scores, elapsed):
         p = pkt.protocol_l7 or pkt.protocol_l4 or "Other"
         proto_counts[p] = proto_counts.get(p, 0) + 1
 
+    total_packets = len(results["packets"])
     proto_table = Table(title="Protocol Breakdown", border_style="dim")
     proto_table.add_column("Protocol", style="cyan")
     proto_table.add_column("Packets", justify="right", style="white")
     proto_table.add_column("%", justify="right", style="dim")
-    for proto, count in sorted(proto_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
-        pct = count / len(results["packets"]) * 100
-        proto_table.add_row(proto, str(count), f"{pct:.1f}%")
+    if total_packets > 0:
+        for proto, count in sorted(proto_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+            pct = count / total_packets * 100
+            proto_table.add_row(proto, str(count), f"{pct:.1f}%")
     console.print(proto_table)
 
     # Threats table

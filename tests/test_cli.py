@@ -2,10 +2,8 @@
 
 import json
 import subprocess
-import sys
 from pathlib import Path
 
-import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_PCAP = PROJECT_ROOT / "samples" / "c2_beacon_test.pcap"
