@@ -137,9 +137,11 @@ def decode_tls(payload: bytes) -> Optional[TLSInfo]:
             # Client Hello
             info.is_client_hello = True
             # Extract SNI from extensions
+            # TLS record header = 5 bytes (content_type + version + length);
+            # handshake header = 4 bytes (type + 3-byte length). ClientHello body
+            # starts at byte 9.
             try:
-                # Simplified SNI extraction — walk past session ID and cipher suites
-                offset = 6 + 4  # handshake header
+                offset = 5 + 4
                 if len(payload) > offset + 34:
                     # Skip: version(2) + random(32)
                     offset += 34
@@ -159,18 +161,19 @@ def decode_tls(payload: bytes) -> Optional[TLSInfo]:
                     if offset + 1 < len(payload):
                         ext_len = struct.unpack("!H", payload[offset:offset+2])[0]
                         offset += 2
-                        ext_end = offset + ext_len
+                        ext_end = min(offset + ext_len, len(payload))
                         # Walk extensions looking for SNI (0x0000)
-                        while offset + 4 < ext_end:
+                        while offset + 4 <= ext_end:
                             ext_type = struct.unpack("!H", payload[offset:offset+2])[0]
                             ext_data_len = struct.unpack("!H", payload[offset+2:offset+4])[0]
-                            if ext_type == 0x0000 and offset + 9 < len(payload):
-                                # SNI list
-                                struct.unpack("!H", payload[offset+5:offset+7])[0]
-                                sni_type = payload[offset+7]
-                                sni_len = struct.unpack("!H", payload[offset+8:offset+10])[0]
-                                if sni_type == 0 and offset + 10 + sni_len <= len(payload):
-                                    info.sni = payload[offset+10:offset+10+sni_len].decode("utf-8", errors="replace")
+                            if ext_type == 0x0000 and offset + 4 + ext_data_len <= len(payload):
+                                # SNI list: server_name_list_len(2) + type(1) + len(2) + name
+                                ext_start = offset + 4
+                                if ext_data_len >= 5:
+                                    sni_type = payload[ext_start + 2]
+                                    sni_len = struct.unpack("!H", payload[ext_start + 3:ext_start + 5])[0]
+                                    if sni_type == 0 and ext_start + 5 + sni_len <= ext_start + ext_data_len:
+                                        info.sni = payload[ext_start + 5:ext_start + 5 + sni_len].decode("utf-8", errors="replace")
                             offset += 4 + ext_data_len
             except (struct.error, IndexError) as e:
                 logger.debug(f"SNI extraction failed: {e}")

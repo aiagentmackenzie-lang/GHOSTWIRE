@@ -4,6 +4,7 @@ from engine.fingerprint.ja4_engine import fingerprint_tls, fingerprint_stream, T
 from engine.fingerprint.ja4h_engine import fingerprint_http, fingerprint_stream as fingerprint_http_stream
 from engine.fingerprint.ja4ssh_engine import fingerprint_ssh, fingerprint_stream as fingerprint_ssh_stream
 from engine.parser.pcap_loader import PacketRecord
+from engine.parser.protocol import decode_tls
 
 
 def _make_tls_client_hello(sni: str = "evil.example.com") -> bytes:
@@ -91,6 +92,51 @@ class TestTLSFingerprint:
         )
         fps = fingerprint_stream([pkt])
         assert len(fps) == 0
+
+
+class TestSNIExtraction:
+    """Regression tests for the off-by-one SNI bug (audit F-02).
+
+    Before the fix, both decode_tls() and fingerprint_tls() used a record-header
+    offset of 6 instead of 5, shifting every downstream offset by one and
+    producing sni='' / garbage cipher_count / ext_count on any real ClientHello
+    with an SNI extension. These tests build a real ClientHello with SNI and
+    assert the field actually parses.
+    """
+
+    def test_decode_tls_extracts_sni(self, tls_client_hello_bytes):
+        info = decode_tls(tls_client_hello_bytes)
+        assert info is not None
+        assert info.is_client_hello is True
+        assert info.sni == "evil.example.com"
+
+    def test_fingerprint_tls_extracts_sni(self, tls_client_hello_bytes):
+        fp = fingerprint_tls(tls_client_hello_bytes, src_ip="10.0.0.1", dst_ip="93.184.216.34",
+                             src_port=50000, dst_port=443)
+        assert fp is not None
+        assert fp.is_client_hello is True
+        assert fp.sni == "evil.example.com"
+
+    def test_fingerprint_tls_cipher_and_ext_counts(self, tls_client_hello_bytes):
+        """cipher_count/ext_count must reflect the actual ClientHello, not garbage."""
+        fp = fingerprint_tls(tls_client_hello_bytes)
+        assert fp is not None
+        assert fp.cipher_count == 1   # one cipher suite in the fixture
+        assert fp.ext_count == 1       # one extension (SNI) in the fixture
+
+    def test_fingerprint_tls_produces_ja4(self, tls_client_hello_bytes):
+        """JA4 must be non-empty when ja4plus is available (audit F-01)."""
+        fp = fingerprint_tls(tls_client_hello_bytes)
+        assert fp is not None
+        assert fp.ja4, "JA4 must be populated via ja4plus integration"
+        assert fp.ja4.startswith("t")  # TLS-over-TCP marker
+
+    def test_fingerprint_tls_produces_ja3(self, tls_client_hello_bytes):
+        """JA3 fallback must be a 32-char hex hash (spec-compliant)."""
+        fp = fingerprint_tls(tls_client_hello_bytes)
+        assert fp is not None
+        assert len(fp.ja3_hash) == 32
+        int(fp.ja3_hash, 16)  # must be valid hex
 
 
 class TestHTTPFingerprint:

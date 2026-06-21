@@ -19,7 +19,6 @@ Fixtures:
 from __future__ import annotations
 
 import struct
-from pathlib import Path
 
 import pytest
 from scapy.all import Ether, IP, TCP, UDP, Raw, wrpcap
