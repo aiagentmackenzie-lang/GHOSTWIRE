@@ -16,5 +16,6 @@ node_modules/
 .coverage
 .pytest_cache/
 htmlcov/
-# BUG_CATALOG.md is committed — the audit trail is version-controlled.
-# GHOSTWIRE_AUDIT_*.md reports are also committed.
+# Internal audit / bug-catalog docs — kept local, not shipped in the public repo.
+BUG_CATALOG.md
+GHOSTWIRE_AUDIT_*.md
