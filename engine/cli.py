@@ -53,6 +53,21 @@ def _setup_logging(verbose: bool):
     logging.basicConfig(level=level, format="%(name)s %(levelname)s: %(message)s")
 
 
+def _distinct_c2_count(all_c2_matches: dict) -> int:
+    """Count distinct (tool_name, matched_value) C2 matches across all keys.
+
+    A single fingerprint is looked up against both src and dst direction keys,
+    so the raw sum(len(v)) double-counts. This collapses to distinct indicators.
+    """
+    seen = set()
+    for matches in all_c2_matches.values():
+        for m in matches:
+            seen.add((m.tool_name, m.match_type, m.matched_value))
+    return len(seen)
+
+
+
+
 def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
     """Run the full analysis pipeline and return results dict."""
     packets = load_pcap(pcap_file, parser=parser)
@@ -126,6 +141,15 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
         c2 += all_c2_matches.get(f"{session.dst_ip}:{session.dst_port}", [])
         c2 += all_c2_matches.get(session.src_ip, [])
         c2 += all_c2_matches.get(session.dst_ip, [])
+        # Dedupe C2 matches accumulated across src/dst keys by (tool, type, value),
+        # keeping the highest-confidence entry, so the threat summary / IOC list
+        # does not show the same tool twice (e.g. 'cobalt_strike, cobalt_strike').
+        deduped: dict[tuple, object] = {}
+        for m in c2:
+            mkey = (m.tool_name, m.match_type, m.matched_value)
+            if mkey not in deduped or m.confidence > getattr(deduped[mkey], "confidence", 0):
+                deduped[mkey] = m
+        c2 = list(deduped.values())
         # Include DNS threats in composite scoring
         beacon = beacon_map.get(session.session_id)
         score = score_session(session.session_id, beacon=beacon, c2_matches=c2, dns_threats=dns_threats_objs)
@@ -193,7 +217,7 @@ def analyze(pcap_file: str, output: str, parser: str, min_score: float, min_pack
             "ssh_fingerprints": len(results["ssh_fps"]),
             "beacons_detected": len(results["beacons"]),
             "dns_threats": len(results["dns_threats_all"]),
-            "c2_matches": sum(len(v) for v in results["all_c2_matches"].values()),
+            "c2_matches": _distinct_c2_count(results["all_c2_matches"]),
             "threats": [t.to_dict() for t in threat_scores[:50]],
         }
         click.echo(json.dumps(result, indent=2))
@@ -307,7 +331,7 @@ def report(pcap_file: str, fmt: str, output_file: str | None, min_score: float, 
         "ssh_fingerprints": len(results["ssh_fps"]),
         "beacons_detected": len(results["beacons"]),
         "dns_threats": len(results["dns_threats_all"]),
-        "c2_matches": sum(len(v) for v in results["all_c2_matches"].values()),
+        "c2_matches": _distinct_c2_count(results["all_c2_matches"]),
         "threats": [t.to_dict() for t in results["threat_scores"] if t.overall_score >= min_score],
     }
 
@@ -351,7 +375,7 @@ def _print_rich_summary(pcap_file, results, threat_scores, elapsed):
     overview.add_row("TLS Fingerprints", str(len(results["tls_fps"])))
     overview.add_row("HTTP Fingerprints", str(len(results["http_fps"])))
     overview.add_row("SSH Fingerprints", str(len(results["ssh_fps"])))
-    overview.add_row("C2 Matches", str(sum(len(v) for v in results["all_c2_matches"].values())))
+    overview.add_row("C2 Matches", str(_distinct_c2_count(results["all_c2_matches"])))
     overview.add_row("Beacons Detected", str(len(results["beacons"])))
     overview.add_row("DNS Threats", str(len(results["dns_threats_all"])))
     overview.add_row("Analysis Time", f"{elapsed:.2f}s")
