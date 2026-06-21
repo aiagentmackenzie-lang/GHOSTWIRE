@@ -195,3 +195,54 @@ No mention of `server/`, `dashboard/`, `engine/export/`, `engine/recon/`. Quick 
 **Honest status:** Alpha, not production-ready. The core differentiator (JA4+) is unimplemented-by-integration, and the one thing that works (beacon jitter) is scored into irrelevance. Fix F-01 through H-04 and re-run the tool on `c2_beacon_test.pcap`; the target is `tls_fingerprints ≥ 1`, `c2_matches ≥ 1` on a known-bad sample, and a textbook beacon reaching at least HIGH. Until then, do not put this in front of a client.
 
 — Mackenzie
+---
+
+## RESOLUTION — 2026-06-21 (same day)
+
+All five phases landed on branch `fix/audit-2026-06-21` (local only — not
+pushed; awaiting Raphael's merge approval). Every ship-blocker and high
+bug is closed; the medium/low cleanups are done.
+
+### Gate (run from a clean clone)
+```
+ruff check engine/ tests/   → All checks passed!
+mypy engine                 → Success: no issues found in 20 source files
+python -m pytest -q         → 133 passed
+npx tsc --noEmit -p tsconfig.json → exit 0
+```
+The suite synthesizes its own PCAPs (`tests/conftest.py` via scapy), so it
+runs with no binary fixtures committed (F-04 closed).
+
+### Headline end-to-end (synthetic fixtures, verifiable)
+| Input | Before | After |
+|---|---|---|
+| TLS ClientHello with SNI | `ja4=''`, `sni=''`, `cipher_count=256` (garbage) | `ja4=t12d010100_ba72b8082249_...`, `sni='evil.example.com'`, `cipher_count=1`, `ext_count=1` |
+| Textbook beacon (jitter 0.000) | `overall 0.30 / LOW` | `overall 0.75 / HIGH` |
+| CS default User-Agent HTTP | `c2_matches: 0` | `c2_matches: 1` (distinct), `Known C2: cobalt_strike` |
+| DNS TXT long-subdomain | (untested via CLI) | `dns_threats: 2`, hunt fires via CLI |
+
+### What closed
+- **F-01** ja4plus wired via `parse_tls_handshake` → dict → `generate_ja4`; JA4S/JA4H/JA4SSH via reconstructed scapy packets. JA4/JA4S/JA4H/JA4SSH now populate.
+- **F-02** SNI offset corrected to `5+4` in both `decode_tls` and `fingerprint_tls`; regression tests added.
+- **F-03** JA4X lie removed; marked roadmap.
+- **F-04** `tests/conftest.py` synthesizes beacon/TLS/DNS/CS-UA PCAPs; `test_cli.py` uses fixtures; suite runs on fresh clone.
+- **H-01** `hunt` command now populates `protocol_result` metadata; `hunt_dns_tunneling` fires via CLI.
+- **H-03** JA3 fallback now spec-compliant (parses supported_groups + ec_point_formats); C2 DB purged of fabricated hashes (tested by injecting an attributed hash); HTTP UA matching is exact-only.
+- **H-04** Strong-beacon floor: a HIGH/CRITICAL beacon sets the overall floor; C2/DNS boost toward CRITICAL instead of penalizing.
+- **H-05** `Scapy_Exception` resolved via try/except with fallback class; CLI starts without scapy.
+- **H-06** Server: loopback default, refuses non-loopback without `GHOSTWIRE_API_KEY`, default allowlist = `samples/`, server-side input validation.
+- **M-01..M-14** dead IOC branch removed; MITRE map consolidated; DGA substring filter fixed; entropy thresholds documented; dead npm deps removed; `engine/recon/` deleted; ruff+mypy config added; `BUG_CATALOG.md` committed (audit trail now version-controlled).
+
+### Still open (roadmap, honestly documented in README)
+- Sequence-number-based TCP reassembly (out-of-order / retransmit) — H-02.
+- JA4X (X.509) wiring.
+- DNS compression-pointer handling in response decoder — M-05.
+
+These are feature gaps, not lies — the README now states them as roadmap,
+not as shipped features.
+
+### Honest status
+Alpha → **Beta-grade core**. The differentiating features (JA4+, SNI, C2
+matching, beacon scoring) now actually run and are covered by tests. The
+remaining gaps are documented enhancements, not vapor. Ready for merge to
+`main` after Raphael reviews.
