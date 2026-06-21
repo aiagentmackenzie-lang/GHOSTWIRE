@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
 
 from engine.parser.pcap_loader import PacketRecord
 
@@ -68,7 +67,7 @@ def _make_session_key(src_ip: str, src_port: int, dst_ip: str, dst_port: int) ->
 
 def _is_syn_only(flags: int) -> bool:
     """Check if this is a SYN-only packet (connection initiation)."""
-    return (flags & 0x02) and not (flags & 0x10)  # SYN set, ACK not set
+    return bool((flags & 0x02) and not (flags & 0x10))  # SYN set, ACK not set
 
 
 def _is_fin(flags: int) -> bool:
@@ -126,7 +125,7 @@ def reconstruct_sessions(packets: list[PacketRecord], session_timeout: float = 3
         )
 
         # Build payload streams and track timing
-        last_time: Optional[float] = None
+        last_time: float | None = None
         client_chunks: list[bytes] = []
         server_chunks: list[bytes] = []
 

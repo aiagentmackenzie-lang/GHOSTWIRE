@@ -1,8 +1,13 @@
 """Tests for export modules (stix, report, mitre_map)."""
 
-from engine.export.stix import build_stix_bundle, iocs_from_analysis, _looks_like_ip, _looks_like_domain
+from engine.export.mitre_map import AttackMapping, map_analysis_to_attack, map_techniques
 from engine.export.report import generate_markdown_report, generate_text_report
-from engine.export.mitre_map import map_analysis_to_attack, map_techniques, AttackMapping
+from engine.export.stix import (
+    _looks_like_domain,
+    _looks_like_ip,
+    build_stix_bundle,
+    iocs_from_analysis,
+)
 
 
 class TestSTIXExport:

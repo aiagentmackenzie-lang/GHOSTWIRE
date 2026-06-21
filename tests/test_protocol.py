@@ -1,7 +1,8 @@
 """Tests for protocol identification (engine/parser/protocol.py)."""
 
 from engine.parser.protocol import (
-    identify_protocol, decode_http,
+    decode_http,
+    identify_protocol,
 )
 
 

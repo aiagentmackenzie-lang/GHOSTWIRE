@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import math
 import logging
-from typing import Callable
+import math
+from collections.abc import Callable
 
 from engine.parser.pcap_loader import PacketRecord
 from engine.parser.session import TCPSession
@@ -48,7 +48,7 @@ BUILTIN_QUERIES: dict[str, dict] = {
 
 def hunt_suspicious_beacons(sessions: list[TCPSession]) -> list[dict]:
     """Find sessions with beacon-like timing patterns."""
-    results = []
+    results: list[dict[str, object]] = []
     for s in sessions:
         if s.packet_count < 10:
             continue
@@ -79,7 +79,7 @@ def hunt_suspicious_beacons(sessions: list[TCPSession]) -> list[dict]:
 
 def hunt_cobalt_strike(sessions: list[TCPSession], packets: list[PacketRecord]) -> list[dict]:
     """Find sessions potentially using Cobalt Strike."""
-    results = []
+    results: list[dict[str, object]] = []
 
     # Check for CS user agents in HTTP traffic
     cs_user_agents = [
@@ -121,7 +121,7 @@ def hunt_cobalt_strike(sessions: list[TCPSession], packets: list[PacketRecord]) 
 
 def hunt_dns_tunneling(packets: list[PacketRecord]) -> list[dict]:
     """Find DNS queries that may be tunneling data."""
-    results = []
+    results: list[dict[str, object]] = []
 
     for pkt in packets:
         if pkt.protocol_l7 != "DNS" or not pkt.raw_payload:
@@ -165,7 +165,7 @@ def hunt_dns_tunneling(packets: list[PacketRecord]) -> list[dict]:
 
 def hunt_data_exfil(sessions: list[TCPSession]) -> list[dict]:
     """Find sessions with large outbound data transfers."""
-    results = []
+    results: list[dict[str, object]] = []
 
     for s in sessions:
         if s.src_to_dst_bytes > 1_000_000:  # > 1MB outbound
@@ -210,7 +210,7 @@ suspicious_ports = {22, 23, 445, 3389, 5985, 5986, 513, 514, 25}
 
 def hunt_lateral_movement(sessions: list[TCPSession]) -> list[dict]:
     """Find internal-to-internal connections on suspicious ports."""
-    results = []
+    results: list[dict[str, object]] = []
     for s in sessions:
         src_private = _is_private_ip(s.src_ip)
         dst_private = _is_private_ip(s.dst_ip)
@@ -230,7 +230,7 @@ def hunt_lateral_movement(sessions: list[TCPSession]) -> list[dict]:
 
 def hunt_encrypted_c2(sessions: list[TCPSession]) -> list[dict]:
     """Find TLS sessions to external IPs with high-entropy payloads."""
-    results = []
+    results: list[dict[str, object]] = []
 
     for s in sessions:
         dst_external = not _is_private_ip(s.dst_ip)
@@ -312,7 +312,7 @@ def run_all_hunts(sessions: list[TCPSession], packets: list[PacketRecord]) -> di
     """
     all_results: dict[str, list[dict]] = {}
 
-    for name, meta in BUILTIN_QUERIES.items():
+    for name, _meta in BUILTIN_QUERIES.items():
         results = run_hunt(name, sessions, packets)
         if results:
             all_results[name] = results

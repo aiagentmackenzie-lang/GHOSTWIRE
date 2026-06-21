@@ -6,7 +6,6 @@ import logging
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -99,18 +98,18 @@ class ICMPInfo:
 class ProtocolResult:
     """Complete protocol decode result."""
     l7_protocol: str = ""
-    tls: Optional[TLSInfo] = None
-    dns: Optional[DNSInfo] = None
-    http: Optional[HTTPInfo] = None
-    ssh: Optional[SSHInfo] = None
-    icmp: Optional[ICMPInfo] = None
+    tls: TLSInfo | None = None
+    dns: DNSInfo | None = None
+    http: HTTPInfo | None = None
+    ssh: SSHInfo | None = None
+    icmp: ICMPInfo | None = None
 
 
 def _shannon_entropy(data: bytes) -> float:
     """Calculate Shannon entropy of byte data."""
     if not data:
         return 0.0
-    freq = {}
+    freq: dict[int, int] = {}
     for b in data:
         freq[b] = freq.get(b, 0) + 1
     import math
@@ -118,7 +117,7 @@ def _shannon_entropy(data: bytes) -> float:
     return -sum((c / length) * math.log2(c / length) for c in freq.values())
 
 
-def decode_tls(payload: bytes) -> Optional[TLSInfo]:
+def decode_tls(payload: bytes) -> TLSInfo | None:
     """Decode TLS handshake from raw payload."""
     if len(payload) < 5:
         return None
@@ -137,9 +136,11 @@ def decode_tls(payload: bytes) -> Optional[TLSInfo]:
             # Client Hello
             info.is_client_hello = True
             # Extract SNI from extensions
+            # TLS record header = 5 bytes (content_type + version + length);
+            # handshake header = 4 bytes (type + 3-byte length). ClientHello body
+            # starts at byte 9.
             try:
-                # Simplified SNI extraction — walk past session ID and cipher suites
-                offset = 6 + 4  # handshake header
+                offset = 5 + 4
                 if len(payload) > offset + 34:
                     # Skip: version(2) + random(32)
                     offset += 34
@@ -159,18 +160,19 @@ def decode_tls(payload: bytes) -> Optional[TLSInfo]:
                     if offset + 1 < len(payload):
                         ext_len = struct.unpack("!H", payload[offset:offset+2])[0]
                         offset += 2
-                        ext_end = offset + ext_len
+                        ext_end = min(offset + ext_len, len(payload))
                         # Walk extensions looking for SNI (0x0000)
-                        while offset + 4 < ext_end:
+                        while offset + 4 <= ext_end:
                             ext_type = struct.unpack("!H", payload[offset:offset+2])[0]
                             ext_data_len = struct.unpack("!H", payload[offset+2:offset+4])[0]
-                            if ext_type == 0x0000 and offset + 9 < len(payload):
-                                # SNI list
-                                struct.unpack("!H", payload[offset+5:offset+7])[0]
-                                sni_type = payload[offset+7]
-                                sni_len = struct.unpack("!H", payload[offset+8:offset+10])[0]
-                                if sni_type == 0 and offset + 10 + sni_len <= len(payload):
-                                    info.sni = payload[offset+10:offset+10+sni_len].decode("utf-8", errors="replace")
+                            if ext_type == 0x0000 and offset + 4 + ext_data_len <= len(payload):
+                                # SNI list: server_name_list_len(2) + type(1) + len(2) + name
+                                ext_start = offset + 4
+                                if ext_data_len >= 5:
+                                    sni_type = payload[ext_start + 2]
+                                    sni_len = struct.unpack("!H", payload[ext_start + 3:ext_start + 5])[0]
+                                    if sni_type == 0 and ext_start + 5 + sni_len <= ext_start + ext_data_len:
+                                        info.sni = payload[ext_start + 5:ext_start + 5 + sni_len].decode("utf-8", errors="replace")
                             offset += 4 + ext_data_len
             except (struct.error, IndexError) as e:
                 logger.debug(f"SNI extraction failed: {e}")
@@ -187,7 +189,7 @@ def decode_tls(payload: bytes) -> Optional[TLSInfo]:
     return info
 
 
-def decode_dns(payload: bytes) -> Optional[DNSInfo]:
+def decode_dns(payload: bytes) -> DNSInfo | None:
     """Decode DNS message from raw payload."""
     if len(payload) < 12:
         return None
@@ -225,7 +227,7 @@ def decode_dns(payload: bytes) -> Optional[DNSInfo]:
     return info
 
 
-def decode_http(payload: bytes) -> Optional[HTTPInfo]:
+def decode_http(payload: bytes) -> HTTPInfo | None:
     """Decode HTTP request or response from raw payload."""
     if not payload:
         return None
@@ -277,7 +279,7 @@ def decode_http(payload: bytes) -> Optional[HTTPInfo]:
     return info
 
 
-def decode_ssh(payload: bytes) -> Optional[SSHInfo]:
+def decode_ssh(payload: bytes) -> SSHInfo | None:
     """Decode SSH protocol from raw payload."""
     if not payload:
         return None
@@ -299,7 +301,7 @@ def decode_ssh(payload: bytes) -> Optional[SSHInfo]:
     return None
 
 
-def decode_icmp(payload: bytes, icmp_type: int = 0, icmp_code: int = 0) -> Optional[ICMPInfo]:
+def decode_icmp(payload: bytes, icmp_type: int = 0, icmp_code: int = 0) -> ICMPInfo | None:
     """Decode ICMP and detect potential tunneling."""
     if not payload:
         return None
@@ -315,7 +317,10 @@ def decode_icmp(payload: bytes, icmp_type: int = 0, icmp_code: int = 0) -> Optio
     inner_data = payload[4:] if len(payload) > 4 else b""  # Skip ICMP header
     if inner_data:
         info.payload_entropy = _shannon_entropy(inner_data)
-        # Normal ICMP echo has predictable patterns; high entropy = possible DNS/ICMP tunnel
+        # ICMP echo payloads are small; the entropy threshold (7.0) is lower
+        # than the 7.5 used for TLS/session payloads because a small payload
+        # saturates high entropy with fewer distinct bytes. Normal ICMP echo
+        # replies carry predictable patterns; high entropy = possible tunnel.
         if info.payload_entropy > 7.0:
             info.tunnel_suspect = True
 

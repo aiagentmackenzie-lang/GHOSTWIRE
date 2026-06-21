@@ -36,6 +36,8 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-cov",
+    "ruff>=0.6",
+    "mypy>=1.10",
 ]
 
 [project.scripts]
@@ -46,3 +48,36 @@ include = ["engine*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = ["E501"]  # line length handled by formatter, not lint
+
+[tool.ruff.lint.per-file-ignores]
+# cli.py resolves the optional scapy dependency (try/except import + fallback
+# class) before importing the engine, so the engine imports legitimately
+# follow non-import code.
+"engine/cli.py" = ["E402"]
+# conftest builds PCAP fixtures and may have unused-by-some-fixtures imports.
+"tests/conftest.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+files = ["engine"]
+# Third-party libs (scapy/dpkt/ja4plus) ship no stubs; don't fail the gate on them.
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# scapy.all populates IP/TCP/UDP/ICMP/Raw at runtime, so mypy reports
+# attr-defined on the from-import lines. These files are the only ones that
+# touch those dynamic attrs; disable attr-defined here only.
+module = ["engine.parser.pcap_loader", "engine.fingerprint.ja4_engine", "engine.fingerprint.ja4h_engine", "engine.fingerprint.ja4ssh_engine"]
+disable_error_code = ["attr-defined"]

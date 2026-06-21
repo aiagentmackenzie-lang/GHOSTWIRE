@@ -1,7 +1,13 @@
 """JA4SSH SSH fingerprinting.
 
-JA4SSH fingerprints SSH client behavior from the key exchange and
-banner exchange phases — useful for identifying SSH-based C2 tunnels.
+JA4SSH fingerprints SSH client behavior from the key exchange and banner
+exchange phases — useful for identifying SSH-based C2 tunnels.
+
+Uses the official ja4plus.generate_ja4ssh() when available (it requires a
+scapy packet, so we reconstruct a minimal one from the raw payload + 5-tuple).
+Falls back to a local SSH banner hash when ja4plus is unavailable. Banner /
+software parsing is always done locally because C2 matching (match_ssh)
+relies on the parsed software string.
 """
 
 from __future__ import annotations
@@ -9,8 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +24,22 @@ _SSH_BANNER_RE = re.compile(rb"^SSH-(\d+\.\d+)-(.+)\r?\n")
 # SSH packet types
 _SSH_MSG_KEXINIT = 20
 _SSH_MSG_NEWKEYS = 21
+
+_HAS_JA4PLUS = False
+try:
+    import ja4plus
+    _HAS_JA4PLUS = True
+except ImportError:
+    pass
+
+_HAS_SCAPY = False
+try:
+    from scapy.all import IP as ScapyIP
+    from scapy.all import TCP as ScapyTCP
+    from scapy.all import Raw as ScapyRaw
+    _HAS_SCAPY = True
+except ImportError:
+    pass
 
 
 @dataclass
@@ -29,26 +50,14 @@ class SSHFingerprint:
     server_banner: str = ""
     ssh_version: str = ""
     client_software: str = ""
-    kex_algorithms: list[str] = None
-    host_key_algorithms: list[str] = None
-    encryption_algorithms: list[str] = None
-    mac_algorithms: list[str] = None
-    compression_algorithms: list[str] = None
+    kex_algorithms: list[str] = field(default_factory=list)
+    host_key_algorithms: list[str] = field(default_factory=list)
+    encryption_algorithms: list[str] = field(default_factory=list)
+    mac_algorithms: list[str] = field(default_factory=list)
+    compression_algorithms: list[str] = field(default_factory=list)
     source_ip: str = ""
     destination_ip: str = ""
     is_client: bool = False
-
-    def __post_init__(self):
-        if self.kex_algorithms is None:
-            self.kex_algorithms = []
-        if self.host_key_algorithms is None:
-            self.host_key_algorithms = []
-        if self.encryption_algorithms is None:
-            self.encryption_algorithms = []
-        if self.mac_algorithms is None:
-            self.mac_algorithms = []
-        if self.compression_algorithms is None:
-            self.compression_algorithms = []
 
     def to_dict(self) -> dict:
         return {
@@ -62,13 +71,12 @@ class SSHFingerprint:
         }
 
 
-def _parse_kexinit(payload: bytes) -> Optional[dict]:
+def _parse_kexinit(payload: bytes) -> dict | None:
     """Parse SSH_MSG_KEXINIT packet to extract algorithm lists."""
     if len(payload) < 6:
         return None
 
     try:
-        # SSH packet: packet_length(4) + padding_length(1) + msg_code(1) + ...
         msg_type = payload[5]
         if msg_type != _SSH_MSG_KEXINIT:
             return None
@@ -86,11 +94,11 @@ def _parse_kexinit(payload: bytes) -> Optional[dict]:
         for name in algo_names:
             if offset + 3 >= len(payload):
                 break
-            name_len = int.from_bytes(payload[offset:offset+4], "big")
+            name_len = int.from_bytes(payload[offset:offset + 4], "big")
             offset += 4
             if offset + name_len > len(payload):
                 break
-            algo_list = payload[offset:offset+name_len].decode("utf-8", errors="replace").split(",")
+            algo_list = payload[offset:offset + name_len].decode("utf-8", errors="replace").split(",")
             algorithms[name] = algo_list
             offset += name_len
 
@@ -101,7 +109,8 @@ def _parse_kexinit(payload: bytes) -> Optional[dict]:
         return None
 
 
-def fingerprint_ssh(payload: bytes, *, src_ip: str = "", dst_ip: str = "") -> Optional[SSHFingerprint]:
+def fingerprint_ssh(payload: bytes, *, src_ip: str = "", dst_ip: str = "",
+                     src_port: int = 0, dst_port: int = 0) -> SSHFingerprint | None:
     """Extract SSH fingerprint from raw payload.
 
     Checks for SSH banner exchange and KEXINIT algorithm lists.
@@ -119,9 +128,22 @@ def fingerprint_ssh(payload: bytes, *, src_ip: str = "", dst_ip: str = "") -> Op
         fp.client_software = banner_match.group(2).decode("utf-8", errors="replace").strip()
         fp.client_banner = f"SSH-{fp.ssh_version}-{fp.client_software}"
 
-        # Simple hash from banner for fingerprint
+        # Official JA4SSH via ja4plus (needs a scapy packet)
+        if _HAS_JA4PLUS and _HAS_SCAPY:
+            try:
+                pkt = (ScapyIP(src=src_ip or "0.0.0.0", dst=dst_ip or "0.0.0.0")
+                       / ScapyTCP(sport=src_port, dport=dst_port)
+                       / ScapyRaw(load=payload))
+                ja4ssh = ja4plus.generate_ja4ssh(pkt)
+                if ja4ssh:
+                    fp.ja4ssh = ja4ssh
+                    return fp
+            except Exception as e:
+                logger.debug(f"ja4plus generate_ja4ssh failed: {e}")
+
+        # Fallback: banner hash (clearly marked as local, not official JA4SSH)
         banner_hash = hashlib.md5(fp.client_banner.encode()).hexdigest()[:12]
-        fp.ja4ssh = f"ssh{fp.ssh_version.replace('.', '')}_{banner_hash}"
+        fp.ja4ssh = f"local_ssh{fp.ssh_version.replace('.', '')}_{banner_hash}"
         return fp
 
     # Check for KEXINIT
@@ -135,10 +157,23 @@ def fingerprint_ssh(payload: bytes, *, src_ip: str = "", dst_ip: str = "") -> Op
             fp.mac_algorithms = algorithms.get("mac_algorithms_client_to_server", [])
             fp.compression_algorithms = algorithms.get("compression_algorithms_client_to_server", [])
 
-            # Build fingerprint hash from algorithm order
+            # ja4plus.generate_ja4ssh also handles KEXINIT (extracts HASSH)
+            if _HAS_JA4PLUS and _HAS_SCAPY:
+                try:
+                    pkt = (ScapyIP(src=src_ip or "0.0.0.0", dst=dst_ip or "0.0.0.0")
+                           / ScapyTCP(sport=src_port, dport=dst_port)
+                           / ScapyRaw(load=payload))
+                    ja4ssh = ja4plus.generate_ja4ssh(pkt)
+                    if ja4ssh:
+                        fp.ja4ssh = ja4ssh
+                        return fp
+                except Exception as e:
+                    logger.debug(f"ja4plus generate_ja4ssh failed: {e}")
+
+            # Fallback hash
             algo_str = ",".join(fp.kex_algorithms[:5]) + "," + ",".join(fp.encryption_algorithms[:3])
             algo_hash = hashlib.md5(algo_str.encode()).hexdigest()[:12]
-            fp.ja4ssh = f"ssh_kex_{algo_hash}"
+            fp.ja4ssh = f"local_ssh_kex_{algo_hash}"
 
         return fp
 
@@ -154,7 +189,11 @@ def fingerprint_stream(packets: list) -> list[SSHFingerprint]:
             continue
         # Only check port 22 or SSH-looking payloads
         if pkt.src_port == 22 or pkt.dst_port == 22 or pkt.raw_payload.startswith(b"SSH-"):
-            fp = fingerprint_ssh(pkt.raw_payload, src_ip=pkt.src_ip, dst_ip=pkt.dst_ip)
+            fp = fingerprint_ssh(
+                pkt.raw_payload,
+                src_ip=pkt.src_ip, dst_ip=pkt.dst_ip,
+                src_port=pkt.src_port, dst_port=pkt.dst_port,
+            )
             if fp:
                 fingerprints.append(fp)
 

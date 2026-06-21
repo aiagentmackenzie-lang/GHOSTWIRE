@@ -1,6 +1,6 @@
 """Tests for C2 beacon detection (engine/detection/beacon.py)."""
 
-from engine.detection.beacon import detect_beacon, detect_beacons, BeaconScore
+from engine.detection.beacon import BeaconScore, detect_beacon, detect_beacons
 from engine.parser.session import TCPSession
 
 

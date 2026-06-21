@@ -1,9 +1,10 @@
 """Tests for the composite threat scorer (engine/detection/scorer.py)."""
 
 import pytest
-from engine.detection.scorer import score_session
+
 from engine.detection.beacon import BeaconScore
 from engine.detection.dns_threats import DNSThreat
+from engine.detection.scorer import score_session
 from engine.fingerprint.c2_database import C2Match
 
 
@@ -11,7 +12,12 @@ class TestScoreSession:
     """Tests for score_session()."""
 
     def test_beacon_only_scoring(self):
-        """Session with only beacon detection should score correctly."""
+        """A CRITICAL beacon alone should score CRITICAL overall (audit H-04 fix).
+
+        Before the fix, the weighted composite capped a beacon-only signal at
+        0.40*0.85 = 0.34 → LOW, drowning a textbook beacon. The strong-beacon
+        floor raises overall to the beacon score when the beacon is HIGH/CRITICAL.
+        """
         beacon = BeaconScore(
             session_id="test-session",
             overall_score=0.85,
@@ -19,10 +25,28 @@ class TestScoreSession:
             iat_jitter=0.05,
         )
         result = score_session("test-session", beacon=beacon)
-        assert result.overall_score == pytest.approx(0.85 * 0.40, abs=0.01)
-        # 0.34 → LOW confidence (>=0.25 but <0.40)
-        assert result.confidence == "LOW"
+        assert result.overall_score == pytest.approx(0.85, abs=0.01)
+        assert result.confidence == "CRITICAL"
         assert result.beacon_score == 0.85
+
+    def test_medium_beacon_no_floor(self):
+        """A MEDIUM/LOW beacon (not HIGH/CRITICAL) must NOT trigger the floor —
+        the weighted composite applies normally so absent C2/DNS doesn't inflate."""
+        beacon = BeaconScore(session_id="s", overall_score=0.5, confidence="MEDIUM")
+        result = score_session("s", beacon=beacon)
+        assert result.overall_score == pytest.approx(0.5 * 0.40, abs=0.01)
+        assert result.confidence == "NEGLIGIBLE"  # 0.20 < 0.25
+
+    def test_strong_beacon_floor_regression(self):
+        """Audit H-04 regression: a CRITICAL beacon with NO c2/dns must reach
+        CRITICAL overall, not be drowned to LOW by the weighted composite."""
+        beacon = BeaconScore(session_id="s", overall_score=0.95, confidence="CRITICAL",
+                             iat_jitter=0.02)
+        result = score_session("s", beacon=beacon)
+        # Without the floor this would be 0.40*0.95 = 0.38 (LOW). With the floor
+        # it is max(0.38, 0.95) = 0.95 → CRITICAL.
+        assert result.overall_score == pytest.approx(0.95, abs=0.01)
+        assert result.confidence == "CRITICAL"
 
     def test_c2_only_scoring(self):
         """Session with only C2 match should score correctly."""
@@ -50,15 +74,17 @@ class TestScoreSession:
         assert result.overall_score == pytest.approx(0.80 * 0.25, abs=0.01)
 
     def test_combined_scoring(self):
-        """Session with beacon + C2 + DNS should use weighted composite."""
-        beacon = BeaconScore(session_id="s1", overall_score=0.9, confidence="HIGH")
+        """Session with HIGH beacon + C2 + DNS: composite boosts above the beacon floor."""
+        beacon = BeaconScore(session_id="s1", overall_score=0.75, confidence="HIGH")
         c2 = C2Match(tool_name="sliver", confidence=0.85, match_type="ja4",
                      matched_value="t12d0504h2_abc", description="Sliver")
         dns = DNSThreat(domain="evil.evil.com", threat_type="dga", confidence=0.7, score=0.7)
 
         result = score_session("s1", beacon=beacon, c2_matches=[c2], dns_threats=[dns])
-        expected = 0.40 * 0.9 + 0.35 * 0.85 + 0.25 * 0.7
-        assert result.overall_score == pytest.approx(expected, abs=0.01)
+        composite = 0.40 * 0.75 + 0.35 * 0.85 + 0.25 * 0.7  # 0.7725
+        # Beacon is HIGH → floor at 0.75; composite (0.7725) > 0.75, so composite wins
+        assert result.overall_score == pytest.approx(max(composite, 0.75), abs=0.01)
+        assert result.overall_score >= 0.75
 
     def test_no_signals_low_score(self):
         """Session with no signals should have negligible score."""
@@ -89,13 +115,11 @@ class TestScoreSession:
 
     def test_confidence_high(self):
         """Overall score 0.60-0.79 should yield HIGH confidence."""
-        beacon = BeaconScore(session_id="s", overall_score=0.85, confidence="HIGH")
-        result = score_session("s", beacon=beacon)
-        # 0.85 * 0.40 = 0.34 → not HIGH alone
-        # Need combined score >= 0.60: use strong C2 too
+        beacon = BeaconScore(session_id="s", overall_score=0.70, confidence="HIGH")
         c2 = C2Match(tool_name="t", confidence=0.95, match_type="x", matched_value="y")
         result = score_session("s", beacon=beacon, c2_matches=[c2])
-        # 0.40*0.85 + 0.35*0.95 = 0.34 + 0.3325 = 0.6725 → HIGH
+        # composite = 0.40*0.70 + 0.35*0.95 = 0.6125; floor at 0.70 → 0.70 → HIGH
+        assert result.overall_score == pytest.approx(0.70, abs=0.01)
         assert result.confidence == "HIGH"
 
     def test_to_dict_roundtrip(self):

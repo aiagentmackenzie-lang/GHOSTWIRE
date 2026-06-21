@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
 
 from engine.detection.beacon import BeaconScore
 from engine.detection.dns_threats import DNSThreat
@@ -20,7 +19,7 @@ class ThreatScore:
     target_type: str  # "session", "ip", "domain"
     overall_score: float = 0.0
     confidence: str = "LOW"
-    beacon_score: Optional[float] = None
+    beacon_score: float | None = None
     c2_matches: list[C2Match] = field(default_factory=list)
     dns_threats: list[DNSThreat] = field(default_factory=list)
     iocs: list[str] = field(default_factory=list)
@@ -44,9 +43,9 @@ class ThreatScore:
 
 def score_session(
     session_id: str,
-    beacon: Optional[BeaconScore] = None,
-    c2_matches: Optional[list[C2Match]] = None,
-    dns_threats: Optional[list[DNSThreat]] = None,
+    beacon: BeaconScore | None = None,
+    c2_matches: list[C2Match] | None = None,
+    dns_threats: list[DNSThreat] | None = None,
 ) -> ThreatScore:
     """Compute composite threat score for a session.
 
@@ -70,7 +69,17 @@ def score_session(
     dns_value = max((t.score for t in dns_threats), default=0.0)
 
     # Weighted composite
-    threat.overall_score = (0.40 * beacon_value + 0.35 * c2_value + 0.25 * dns_value)
+    composite = (0.40 * beacon_value + 0.35 * c2_value + 0.25 * dns_value)
+
+    # Strong-beacon floor (audit H-04): a textbook beacon (jitter < 0.1) should
+    # not be drowned to LOW just because C2/DNS signals are absent. When the
+    # beacon detector itself is HIGH/CRITICAL, the beacon score is the floor
+    # and C2/DNS signals act as a boost toward CRITICAL — not as a penalty.
+    # Without this, a perfect beacon caps at 0.40*0.95 = 0.38 < MEDIUM.
+    if beacon and beacon.confidence in ("HIGH", "CRITICAL"):
+        threat.overall_score = max(composite, beacon_value)
+    else:
+        threat.overall_score = composite
 
     # Assign confidence
     if threat.overall_score >= 0.80:

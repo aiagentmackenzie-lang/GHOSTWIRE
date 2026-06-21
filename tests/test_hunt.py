@@ -1,13 +1,19 @@
 """Tests for hunt mode queries (engine/detection/hunt.py)."""
 
 from engine.detection.hunt import (
-    hunt_suspicious_beacons, hunt_cobalt_strike, hunt_dns_tunneling,
-    hunt_data_exfil, hunt_lateral_movement, hunt_encrypted_c2,
-    run_hunt, run_all_hunts, BUILTIN_QUERIES,
+    BUILTIN_QUERIES,
     _is_private_ip,
+    hunt_cobalt_strike,
+    hunt_data_exfil,
+    hunt_dns_tunneling,
+    hunt_encrypted_c2,
+    hunt_lateral_movement,
+    hunt_suspicious_beacons,
+    run_all_hunts,
+    run_hunt,
 )
-from engine.parser.session import TCPSession
 from engine.parser.pcap_loader import PacketRecord
+from engine.parser.session import TCPSession
 
 
 def _make_session(

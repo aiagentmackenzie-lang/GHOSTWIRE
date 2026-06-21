@@ -16,4 +16,6 @@ node_modules/
 .coverage
 .pytest_cache/
 htmlcov/
+# Internal audit / bug-catalog docs — kept local, not shipped in the public repo.
 BUG_CATALOG.md
+GHOSTWIRE_AUDIT_*.md

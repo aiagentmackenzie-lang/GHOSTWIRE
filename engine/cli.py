@@ -14,30 +14,35 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
 
 import click
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
+from rich.table import Table
 
-from scapy.all import Scapy_Exception
+# scapy is an optional fast-path dependency (pcap_loader falls back to dpkt).
+# Import Scapy_Exception lazily so the CLI still starts when scapy is absent.
+try:
+    from scapy.all import Scapy_Exception
+except ImportError:
+    class Scapy_Exception(Exception):  # type: ignore[no-redef]
+        """Fallback so `except (ValueError, Scapy_Exception)` is valid without scapy."""
 
 from engine import __version__
-from engine.parser.pcap_loader import load_pcap
-from engine.parser.protocol import identify_protocol
-from engine.parser.session import reconstruct_sessions
+from engine.detection.beacon import detect_beacons
+from engine.detection.dns_threats import DNSThreat, analyze_dns
+from engine.detection.hunt import BUILTIN_QUERIES, run_all_hunts, run_hunt
+from engine.detection.scorer import score_session
+from engine.export.mitre_map import map_analysis_to_attack
+from engine.export.report import generate_markdown_report, generate_text_report, save_report
+from engine.export.stix import build_stix_bundle, iocs_from_analysis
+from engine.fingerprint.c2_database import match_all
 from engine.fingerprint.ja4_engine import fingerprint_stream as tls_fingerprint
 from engine.fingerprint.ja4h_engine import fingerprint_stream as http_fingerprint
 from engine.fingerprint.ja4ssh_engine import fingerprint_stream as ssh_fingerprint
-from engine.fingerprint.c2_database import match_all
-from engine.detection.beacon import detect_beacons
-from engine.detection.dns_threats import analyze_dns, DNSThreat
-from engine.detection.scorer import score_session
-from engine.detection.hunt import BUILTIN_QUERIES, run_hunt, run_all_hunts
-from engine.export.stix import build_stix_bundle, iocs_from_analysis
-from engine.export.report import generate_markdown_report, generate_text_report, save_report
-from engine.export.mitre_map import map_analysis_to_attack
+from engine.parser.pcap_loader import load_pcap
+from engine.parser.protocol import identify_protocol
+from engine.parser.session import reconstruct_sessions
 
 console = Console()
 logger = logging.getLogger("ghostwire")
@@ -46,6 +51,21 @@ logger = logging.getLogger("ghostwire")
 def _setup_logging(verbose: bool):
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(name)s %(levelname)s: %(message)s")
+
+
+def _distinct_c2_count(all_c2_matches: dict) -> int:
+    """Count distinct (tool_name, matched_value) C2 matches across all keys.
+
+    A single fingerprint is looked up against both src and dst direction keys,
+    so the raw sum(len(v)) double-counts. This collapses to distinct indicators.
+    """
+    seen = set()
+    for matches in all_c2_matches.values():
+        for m in matches:
+            seen.add((m.tool_name, m.match_type, m.matched_value))
+    return len(seen)
+
+
 
 
 def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
@@ -78,19 +98,19 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
 
     # C2 matching — check both source and destination directions
     all_c2_matches: dict[str, list] = {}
-    for fp in tls_fps:
-        for key in (f"{fp.source_ip}:{fp.source_port}", f"{fp.destination_ip}:{fp.destination_port}"):
-            matches = match_all(ja4=fp.ja4, ja3=fp.ja3_hash)
+    for tls_fp in tls_fps:
+        for key in (f"{tls_fp.source_ip}:{tls_fp.source_port}", f"{tls_fp.destination_ip}:{tls_fp.destination_port}"):
+            matches = match_all(ja4=tls_fp.ja4, ja3=tls_fp.ja3_hash)
             if matches:
                 all_c2_matches.setdefault(key, []).extend(matches)
-    for fp in http_fps:
-        for key in (fp.source_ip, fp.destination_ip):
-            matches = match_all(user_agent=fp.user_agent)
+    for http_fp in http_fps:
+        for key in (http_fp.source_ip, http_fp.destination_ip):
+            matches = match_all(user_agent=http_fp.user_agent)
             if matches:
                 all_c2_matches.setdefault(key, []).extend(matches)
-    for fp in ssh_fps:
-        for key in (fp.source_ip, fp.destination_ip):
-            matches = match_all(ssh_banner=fp.client_banner, ssh_software=fp.client_software)
+    for ssh_fp in ssh_fps:
+        for key in (ssh_fp.source_ip, ssh_fp.destination_ip):
+            matches = match_all(ssh_banner=ssh_fp.client_banner, ssh_software=ssh_fp.client_software)
             if matches:
                 all_c2_matches.setdefault(key, []).extend(matches)
 
@@ -121,6 +141,15 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
         c2 += all_c2_matches.get(f"{session.dst_ip}:{session.dst_port}", [])
         c2 += all_c2_matches.get(session.src_ip, [])
         c2 += all_c2_matches.get(session.dst_ip, [])
+        # Dedupe C2 matches accumulated across src/dst keys by (tool, type, value),
+        # keeping the highest-confidence entry, so the threat summary / IOC list
+        # does not show the same tool twice (e.g. 'cobalt_strike, cobalt_strike').
+        deduped: dict[tuple, object] = {}
+        for m in c2:
+            mkey = (m.tool_name, m.match_type, m.matched_value)
+            if mkey not in deduped or m.confidence > getattr(deduped[mkey], "confidence", 0):
+                deduped[mkey] = m
+        c2 = list(deduped.values())
         # Include DNS threats in composite scoring
         beacon = beacon_map.get(session.session_id)
         score = score_session(session.session_id, beacon=beacon, c2_matches=c2, dns_threats=dns_threats_objs)
@@ -188,7 +217,7 @@ def analyze(pcap_file: str, output: str, parser: str, min_score: float, min_pack
             "ssh_fingerprints": len(results["ssh_fps"]),
             "beacons_detected": len(results["beacons"]),
             "dns_threats": len(results["dns_threats_all"]),
-            "c2_matches": sum(len(v) for v in results["all_c2_matches"].values()),
+            "c2_matches": _distinct_c2_count(results["all_c2_matches"]),
             "threats": [t.to_dict() for t in threat_scores[:50]],
         }
         click.echo(json.dumps(result, indent=2))
@@ -203,7 +232,7 @@ def analyze(pcap_file: str, output: str, parser: str, min_score: float, min_pack
               help="Run a specific hunt query")
 @click.option("--all", "run_all", is_flag=True, help="Run all hunt queries")
 @click.option("--output", "-o", type=click.Choice(["json", "summary"]), default="summary")
-def hunt(pcap_file: str, query: Optional[str], run_all: bool, output: str):
+def hunt(pcap_file: str, query: str | None, run_all: bool, output: str):
     """Hunt for threats using predefined queries."""
 
     try:
@@ -222,6 +251,15 @@ def hunt(pcap_file: str, query: Optional[str], run_all: bool, output: str):
             result = identify_protocol(pkt.src_port, pkt.dst_port, pkt.raw_payload, pkt.protocol_l4, pkt.metadata)
             if result.l7_protocol:
                 pkt.protocol_l7 = result.l7_protocol
+                # Populate metadata so hunt queries (e.g. hunt_dns_tunneling) can
+                # read decoded protocol fields via the CLI path, not just unit tests.
+                pkt.metadata["protocol_result"] = {
+                    "tls": asdict(result.tls) if result.tls else None,
+                    "dns": asdict(result.dns) if result.dns else None,
+                    "http": asdict(result.http) if result.http else None,
+                    "ssh": asdict(result.ssh) if result.ssh else None,
+                    "icmp": asdict(result.icmp) if result.icmp else None,
+                }
 
     sessions = reconstruct_sessions(packets)
 
@@ -269,7 +307,7 @@ def hunt(pcap_file: str, query: Optional[str], run_all: bool, output: str):
               help="Minimum threat score to report (0.0-1.0)")
 @click.option("--min-packets", type=int, default=10,
               help="Minimum packets per session for beacon analysis")
-def report(pcap_file: str, fmt: str, output_file: Optional[str], min_score: float, min_packets: int):
+def report(pcap_file: str, fmt: str, output_file: str | None, min_score: float, min_packets: int):
     """Generate threat analysis report."""
 
     try:
@@ -293,7 +331,7 @@ def report(pcap_file: str, fmt: str, output_file: Optional[str], min_score: floa
         "ssh_fingerprints": len(results["ssh_fps"]),
         "beacons_detected": len(results["beacons"]),
         "dns_threats": len(results["dns_threats_all"]),
-        "c2_matches": sum(len(v) for v in results["all_c2_matches"].values()),
+        "c2_matches": _distinct_c2_count(results["all_c2_matches"]),
         "threats": [t.to_dict() for t in results["threat_scores"] if t.overall_score >= min_score],
     }
 
@@ -337,7 +375,7 @@ def _print_rich_summary(pcap_file, results, threat_scores, elapsed):
     overview.add_row("TLS Fingerprints", str(len(results["tls_fps"])))
     overview.add_row("HTTP Fingerprints", str(len(results["http_fps"])))
     overview.add_row("SSH Fingerprints", str(len(results["ssh_fps"])))
-    overview.add_row("C2 Matches", str(sum(len(v) for v in results["all_c2_matches"].values())))
+    overview.add_row("C2 Matches", str(_distinct_c2_count(results["all_c2_matches"])))
     overview.add_row("Beacons Detected", str(len(results["beacons"])))
     overview.add_row("DNS Threats", str(len(results["dns_threats_all"])))
     overview.add_row("Analysis Time", f"{elapsed:.2f}s")

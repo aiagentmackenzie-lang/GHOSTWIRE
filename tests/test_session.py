@@ -1,8 +1,9 @@
 """Tests for TCP session reconstruction (engine/parser/session.py)."""
 
 import pytest
-from engine.parser.session import reconstruct_sessions, _make_session_key
+
 from engine.parser.pcap_loader import PacketRecord
+from engine.parser.session import _make_session_key, reconstruct_sessions
 
 
 def _make_packet(index, timestamp, src_ip, dst_ip, src_port, dst_port,

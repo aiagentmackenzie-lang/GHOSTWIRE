@@ -2,16 +2,35 @@
 
 JA4H creates a fingerprint of HTTP client behavior based on headers,
 header order, and values — useful for identifying C2 tools and clients.
+
+Uses the official ja4plus.generate_ja4h() when available (it requires a scapy
+packet, so we reconstruct a minimal one from the raw payload + 5-tuple).
+Falls back to a local JA4H-style hash when ja4plus is unavailable.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+_HAS_JA4PLUS = False
+try:
+    import ja4plus
+    _HAS_JA4PLUS = True
+except ImportError:
+    pass
+
+_HAS_SCAPY = False
+try:
+    from scapy.all import IP as ScapyIP
+    from scapy.all import TCP as ScapyTCP
+    from scapy.all import Raw as ScapyRaw
+    _HAS_SCAPY = True
+except ImportError:
+    pass
 
 
 @dataclass
@@ -21,21 +40,13 @@ class HTTPFingerprint:
     method: str = ""
     http_version: str = ""
     header_count: int = 0
-    header_order: list[str] = None
+    header_order: list[str] = field(default_factory=list)
     cookie_present: bool = False
     user_agent: str = ""
-    accepted_encodings: list[str] = None
-    accepted_languages: list[str] = None
+    accepted_encodings: list[str] = field(default_factory=list)
+    accepted_languages: list[str] = field(default_factory=list)
     source_ip: str = ""
     destination_ip: str = ""
-
-    def __post_init__(self):
-        if self.header_order is None:
-            self.header_order = []
-        if self.accepted_encodings is None:
-            self.accepted_encodings = []
-        if self.accepted_languages is None:
-            self.accepted_languages = []
 
     def to_dict(self) -> dict:
         return {
@@ -65,11 +76,33 @@ def _extract_headers(payload: bytes) -> list[tuple[str, str]]:
         return []
 
 
-def fingerprint_http(payload: bytes, *, src_ip: str = "", dst_ip: str = "") -> Optional[HTTPFingerprint]:
+def _local_ja4h_hash(fp: HTTPFingerprint) -> str:
+    """Local JA4H-style hash used when ja4plus is unavailable.
+
+    Format: {method}{version}{cookie}{header_count}_{md5(header_order)[:12]}
+    Not the official FoxIO JA4H string, but a stable fingerprint of the same
+    behavioral surface. Clearly distinct from a real JA4H (prefixed `local_`).
+    """
+    method_code = {"GET": "g", "POST": "p", "PUT": "u", "DELETE": "d",
+                   "PATCH": "t", "HEAD": "h", "OPTIONS": "o"}.get(fp.method, "x")
+    version_code = "1" if "1.1" in fp.http_version else "2" if "2" in fp.http_version else "0"
+    cookie_code = "c" if fp.cookie_present else "n"
+    header_str = ",".join(fp.header_order)
+    header_hash = hashlib.md5(header_str.encode()).hexdigest()[:12]
+    return f"local_{method_code}{version_code}{cookie_code}{fp.header_count:02d}_{header_hash}"
+
+
+def fingerprint_http(payload: bytes, *, src_ip: str = "", dst_ip: str = "",
+                     src_port: int = 0, dst_port: int = 0) -> HTTPFingerprint | None:
     """Extract JA4H-style fingerprint from HTTP request payload.
 
-    JA4H format: {method}{http_version}{cookie_flag}{header_count_hash}{header_order_hash}
-    Simplified: we create a deterministic hash from header ordering and values.
+    Args:
+        payload: Raw HTTP request bytes.
+        src_ip, dst_ip, src_port, dst_port: Connection metadata (used to
+            reconstruct a scapy packet for ja4plus).
+
+    Returns:
+        HTTPFingerprint if an HTTP request is detected, None otherwise.
     """
     if not payload:
         return None
@@ -106,18 +139,21 @@ def fingerprint_http(payload: bytes, *, src_ip: str = "", dst_ip: str = "") -> O
         elif name_lower == "accept-language":
             fp.accepted_languages = [e.strip() for e in value.split(",")]
 
-    # Generate JA4H hash from header fingerprint
-    method_code = {"GET": "g", "POST": "p", "PUT": "u", "DELETE": "d",
-                   "PATCH": "t", "HEAD": "h", "OPTIONS": "o"}.get(fp.method, "x")
-    version_code = "1" if "1.1" in fp.http_version else "2" if "2" in fp.http_version else "0"
-    cookie_code = "c" if fp.cookie_present else "n"
+    # Official JA4H via ja4plus (reconstruct a scapy packet — generate_ja4h needs one)
+    if _HAS_JA4PLUS and _HAS_SCAPY:
+        try:
+            pkt = (ScapyIP(src=src_ip or "0.0.0.0", dst=dst_ip or "0.0.0.0")
+                   / ScapyTCP(sport=src_port, dport=dst_port)
+                   / ScapyRaw(load=payload))
+            ja4h = ja4plus.generate_ja4h(pkt)
+            if ja4h:
+                fp.ja4h = ja4h
+                return fp
+        except Exception as e:
+            logger.debug(f"ja4plus generate_ja4h failed: {e}")
 
-    # Hash the header order for deterministic fingerprinting
-    header_str = ",".join(fp.header_order)
-    header_hash = hashlib.md5(header_str.encode()).hexdigest()[:12]
-
-    fp.ja4h = f"{method_code}{version_code}{cookie_code}{fp.header_count:02d}_{header_hash}"
-
+    # Fallback: local hash
+    fp.ja4h = _local_ja4h_hash(fp)
     return fp
 
 
@@ -128,7 +164,11 @@ def fingerprint_stream(packets: list) -> list[HTTPFingerprint]:
     for pkt in packets:
         if pkt.protocol_l4 != "TCP" or not pkt.raw_payload:
             continue
-        fp = fingerprint_http(pkt.raw_payload, src_ip=pkt.src_ip, dst_ip=pkt.dst_ip)
+        fp = fingerprint_http(
+            pkt.raw_payload,
+            src_ip=pkt.src_ip, dst_ip=pkt.dst_ip,
+            src_port=pkt.src_port, dst_port=pkt.dst_port,
+        )
         if fp:
             fingerprints.append(fp)
 
