@@ -21,15 +21,12 @@ from rich.panel import Panel
 from rich.table import Table
 
 # scapy is an optional fast-path dependency (pcap_loader falls back to dpkt).
-# Import Scapy_Exception lazily so the CLI still starts when scapy is absent;
-# define a fallback exception class for the except clauses below.
+# Import Scapy_Exception lazily so the CLI still starts when scapy is absent.
 try:
-    from scapy.all import Scapy_Exception as _ScapyException
+    from scapy.all import Scapy_Exception
 except ImportError:
-    class _ScapyException(Exception):
+    class Scapy_Exception(Exception):  # type: ignore[no-redef]
         """Fallback so `except (ValueError, Scapy_Exception)` is valid without scapy."""
-
-Scapy_Exception = _ScapyException
 
 from engine import __version__
 from engine.detection.beacon import detect_beacons
@@ -86,19 +83,19 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
 
     # C2 matching — check both source and destination directions
     all_c2_matches: dict[str, list] = {}
-    for fp in tls_fps:
-        for key in (f"{fp.source_ip}:{fp.source_port}", f"{fp.destination_ip}:{fp.destination_port}"):
-            matches = match_all(ja4=fp.ja4, ja3=fp.ja3_hash)
+    for tls_fp in tls_fps:
+        for key in (f"{tls_fp.source_ip}:{tls_fp.source_port}", f"{tls_fp.destination_ip}:{tls_fp.destination_port}"):
+            matches = match_all(ja4=tls_fp.ja4, ja3=tls_fp.ja3_hash)
             if matches:
                 all_c2_matches.setdefault(key, []).extend(matches)
-    for fp in http_fps:
-        for key in (fp.source_ip, fp.destination_ip):
-            matches = match_all(user_agent=fp.user_agent)
+    for http_fp in http_fps:
+        for key in (http_fp.source_ip, http_fp.destination_ip):
+            matches = match_all(user_agent=http_fp.user_agent)
             if matches:
                 all_c2_matches.setdefault(key, []).extend(matches)
-    for fp in ssh_fps:
-        for key in (fp.source_ip, fp.destination_ip):
-            matches = match_all(ssh_banner=fp.client_banner, ssh_software=fp.client_software)
+    for ssh_fp in ssh_fps:
+        for key in (ssh_fp.source_ip, ssh_fp.destination_ip):
+            matches = match_all(ssh_banner=ssh_fp.client_banner, ssh_software=ssh_fp.client_software)
             if matches:
                 all_c2_matches.setdefault(key, []).extend(matches)
 

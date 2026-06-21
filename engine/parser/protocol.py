@@ -109,7 +109,7 @@ def _shannon_entropy(data: bytes) -> float:
     """Calculate Shannon entropy of byte data."""
     if not data:
         return 0.0
-    freq = {}
+    freq: dict[int, int] = {}
     for b in data:
         freq[b] = freq.get(b, 0) + 1
     import math
@@ -317,7 +317,10 @@ def decode_icmp(payload: bytes, icmp_type: int = 0, icmp_code: int = 0) -> ICMPI
     inner_data = payload[4:] if len(payload) > 4 else b""  # Skip ICMP header
     if inner_data:
         info.payload_entropy = _shannon_entropy(inner_data)
-        # Normal ICMP echo has predictable patterns; high entropy = possible DNS/ICMP tunnel
+        # ICMP echo payloads are small; the entropy threshold (7.0) is lower
+        # than the 7.5 used for TLS/session payloads because a small payload
+        # saturates high entropy with fewer distinct bytes. Normal ICMP echo
+        # replies carry predictable patterns; high entropy = possible tunnel.
         if info.payload_entropy > 7.0:
             info.tunnel_suspect = True
 

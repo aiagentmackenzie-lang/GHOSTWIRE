@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -40,21 +40,13 @@ class HTTPFingerprint:
     method: str = ""
     http_version: str = ""
     header_count: int = 0
-    header_order: list[str] = None
+    header_order: list[str] = field(default_factory=list)
     cookie_present: bool = False
     user_agent: str = ""
-    accepted_encodings: list[str] = None
-    accepted_languages: list[str] = None
+    accepted_encodings: list[str] = field(default_factory=list)
+    accepted_languages: list[str] = field(default_factory=list)
     source_ip: str = ""
     destination_ip: str = ""
-
-    def __post_init__(self):
-        if self.header_order is None:
-            self.header_order = []
-        if self.accepted_encodings is None:
-            self.accepted_encodings = []
-        if self.accepted_languages is None:
-            self.accepted_languages = []
 
     def to_dict(self) -> dict:
         return {

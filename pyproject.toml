@@ -71,7 +71,13 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 no_implicit_optional = true
 check_untyped_defs = true
-# engine is the shipped package; dashboard/server are TS and out of scope.
 files = ["engine"]
 # Third-party libs (scapy/dpkt/ja4plus) ship no stubs; don't fail the gate on them.
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# scapy.all populates IP/TCP/UDP/ICMP/Raw at runtime, so mypy reports
+# attr-defined on the from-import lines. These files are the only ones that
+# touch those dynamic attrs; disable attr-defined here only.
+module = ["engine.parser.pcap_loader", "engine.fingerprint.ja4_engine", "engine.fingerprint.ja4h_engine", "engine.fingerprint.ja4ssh_engine"]
+disable_error_code = ["attr-defined"]

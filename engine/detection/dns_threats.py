@@ -90,11 +90,20 @@ def detect_dga(domain: str, query_type: str = "A") -> DNSThreat | None:
     if not domain or domain.endswith(".arpa") or domain in (".", "localhost"):
         return None
 
-    # Skip common CDNs and well-known services
-    known_good = {"google", "amazon", "cloudflare", "microsoft", "apple", "facebook",
-                  "akamai", "fastly", "cloudfront", "azure", "aws"}
-    if any(kg in domain.lower() for kg in known_good):
-        return None
+    # Skip common CDNs and well-known services. Match on the registrable
+    # domain (the second-level label, i.e. the label immediately before the
+    # TLD), NOT on substrings -- audit M-06: substring matching made "aws"
+    # match "drawsomething.com" and "apple" match "snapple.com".
+    known_good_slds = {
+        "google", "amazon", "cloudflare", "microsoft", "apple", "facebook",
+        "akamai", "fastly", "cloudfront", "azure", "aws", "github",
+        "googleapis", "gstatic",
+    }
+    labels = domain.split(".")
+    if len(labels) >= 2:
+        sld_label = labels[-2].lower()
+        if sld_label in known_good_slds:
+            return None
 
     threat = DNSThreat(domain=domain, query_type=query_type)
     score = 0.0

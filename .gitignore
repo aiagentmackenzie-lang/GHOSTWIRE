@@ -16,4 +16,5 @@ node_modules/
 .coverage
 .pytest_cache/
 htmlcov/
-BUG_CATALOG.md
+# BUG_CATALOG.md is committed — the audit trail is version-controlled.
+# GHOSTWIRE_AUDIT_*.md reports are also committed.

@@ -7,6 +7,8 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+from engine.export.mitre_map import TECHNIQUE_MAP
+
 logger = logging.getLogger(__name__)
 
 
@@ -149,24 +151,13 @@ def _looks_like_domain(value: str) -> bool:
 
 
 def _mitre_name(tech_id: str) -> str:
-    """Map MITRE technique IDs to human-readable names."""
-    mitre_map = {
-        "T1071.001": "Application Layer Protocol: Web Protocols",
-        "T1071.004": "Application Layer Protocol: DNS",
-        "T1573.001": "Encrypted Channel: Symmetric Cryptography",
-        "T1573.002": "Encrypted Channel: Asymmetric Cryptography",
-        "T1571": "Non-Standard Port",
-        "T1059.001": "Command and Scripting Interpreter: PowerShell",
-        "T1021.001": "Remote Services: Remote Desktop Protocol",
-        "T1021.004": "Remote Services: SSH",
-        "T1095": "Non-Application Layer Protocol",
-        "T1041": "Exfiltration Over C2 Channel",
-        "T1048": "Exfiltration Over Alternative Protocol",
-        "T1001": "Data Obfuscation",
-        "T1568": "Dynamic Resolution",
-        "T1568.002": "Dynamic Resolution: Domain Generation Algorithms",
-    }
-    return mitre_map.get(tech_id, f"MITRE ATT&CK {tech_id}")
+    """Map MITRE technique IDs to human-readable names.
+
+    Single source of truth: engine.export.mitre_map.TECHNIQUE_MAP (audit M-07 --
+    a duplicate dict previously lived here and drifted from mitre_map).
+    """
+    info = TECHNIQUE_MAP.get(tech_id, {})
+    return info.get("name", f"MITRE ATT&CK {tech_id}")
 
 
 def export_stix(bundle: dict, filepath: str) -> None:
@@ -179,9 +170,10 @@ def export_stix(bundle: dict, filepath: str) -> None:
 def iocs_from_analysis(analysis: dict) -> list[dict]:
     """Convert GHOSTWIRE analysis results into IOC dicts for STIX export.
 
-    Uses session metadata (src_ip, dst_ip) directly instead of parsing
-    session_id strings. Falls back to session_id parsing only when the
-    structured fields are not available.
+    Threats carry a `target` string in session_id form ("src_ip:port-dst_ip:port").
+    IPs are extracted by parsing that string. (audit M-01: a previous
+    "preferred structured src_ip/dst_ip" branch was dead because
+    ThreatScore.to_dict() never emitted those fields; removed.)
     """
     iocs: list[dict] = []
 
@@ -191,22 +183,9 @@ def iocs_from_analysis(analysis: dict) -> list[dict]:
         mitre_techniques = threat.get("mitre_techniques", [])
         summary = threat.get("summary", "")
 
-        # --- Extract IPs from structured session fields ---
-        # Prefer src_ip / dst_ip if present (added by enriched threat scores)
-        for ip_field in ("src_ip", "dst_ip"):
-            ip_val = threat.get(ip_field, "")
-            if ip_val and _looks_like_ip(ip_val):
-                iocs.append({
-                    "type": "ipv4-addr",
-                    "value": ip_val,
-                    "confidence": overall_score,
-                    "threat_type": "c2_communication",
-                    "mitre_techniques": mitre_techniques,
-                    "description": summary,
-                })
-
-        # Fallback: parse target string (e.g. "10.0.0.1:443-192.168.1.1:50000")
-        if not threat.get("src_ip") and not threat.get("dst_ip") and target:
+        # Extract IPs by parsing the session_id target string
+        # (e.g. "10.0.0.1:443-192.168.1.1:50000")
+        if target:
             for segment in target.split("-"):
                 ip_part = segment.split(":")[0]
                 if _looks_like_ip(ip_part):

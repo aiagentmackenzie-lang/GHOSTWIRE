@@ -14,19 +14,20 @@ app.get('/health', async () => ({ status: 'ok', version: '0.1.0' }));
 // Store analysis results in memory (simple approach for now)
 let currentAnalysis: any = null;
 
-// ─── Auth middleware ────────────────────────────────────────────
-// If GHOSTWIRE_API_KEY is set, require Authorization: Bearer <key>
-// If unset, the API is open (local-dev mode only).
+// ─── Auth middleware ──────────────────────────────────────────────────────
+// If GHOSTWIRE_API_KEY is set, require Authorization: Bearer <key>.
+// If unset, the API is open — but the server refuses to bind a non-loopback
+// host without a key (see startup check at the bottom), so "open" is only
+// reachable on localhost. (audit H-06)
 const API_KEY = process.env.GHOSTWIRE_API_KEY || null;
 
 app.addHook('onRequest', async (request: any, reply: any) => {
   // Skip auth for health checks
   if (request.url === '/health') return;
 
-  // WebSocket auth: validate query param or origin
-  if (request.url === '/ws') {
+  // WebSocket auth: validate query param or Authorization header
+  if (request.url === '/ws' || request.url.startsWith('/ws?')) {
     if (API_KEY) {
-      // For WebSocket, accept token from query param or Authorization header
       const url = new URL(request.url, `http://${request.headers.host}`);
       const wsToken = url.searchParams.get('token');
       const auth = request.headers['authorization'];
@@ -45,15 +46,24 @@ app.addHook('onRequest', async (request: any, reply: any) => {
   }
 });
 
-// ─── Path validation ──────────────────────────────────────────
+// ─── Path validation ──────────────────────────────────────────────────────
 const ALLOWED_EXTENSIONS = ['.pcap', '.pcapng', '.cap'];
 
-// Allowed directories for PCAP files (configurable via env)
-// Defaults to project root's samples/ directory
+// Allowed directories for PCAP files (configurable via env).
+// Default: the project's own samples/ directory, so out-of-the-box the server
+// can only read captures shipped with the project, not arbitrary files on the
+// host. Operators who want to analyze captures elsewhere must explicitly set
+// GHOSTWIRE_ALLOWED_DIRS=/path/a:/path/b. (audit H-06)
+const PROJECT_ROOT = path.resolve(__dirname, '..');
+const DEFAULT_ALLOWED_DIR = path.join(PROJECT_ROOT, 'samples');
 const ALLOWED_DIRS = (process.env.GHOSTWIRE_ALLOWED_DIRS || '')
     .split(':')
+    .map((d) => d.trim())
     .filter(Boolean)
-    .map(d => path.resolve(d));
+    .map((d) => path.resolve(d));
+if (ALLOWED_DIRS.length === 0) {
+  ALLOWED_DIRS.push(DEFAULT_ALLOWED_DIR);
+}
 
 function validateFilePath(filePath: string): string | null {
   // Resolve to absolute path and reject traversal
@@ -64,12 +74,12 @@ function validateFilePath(filePath: string): string | null {
     return 'Path traversal rejected';
   }
 
-  // If ALLOWED_DIRS is configured, restrict to those directories
-  if (ALLOWED_DIRS.length > 0) {
-    const allowed = ALLOWED_DIRS.some(dir => resolved.startsWith(dir + path.sep) || resolved === dir);
-    if (!allowed) {
-      return `Access denied: file outside allowed directories`;
-    }
+  // Restrict to the configured allowlist (fail-closed: default = samples/).
+  const allowed = ALLOWED_DIRS.some(
+    (dir) => resolved.startsWith(dir + path.sep) || resolved === dir,
+  );
+  if (!allowed) {
+    return 'Access denied: file outside allowed directories. Configure GHOSTWIRE_ALLOWED_DIRS if needed.';
   }
 
   // Restrict to allowed extensions
@@ -89,13 +99,26 @@ function validateFilePath(filePath: string): string | null {
 }
 
 app.post('/api/analyze', async (request: any, reply: any) => {
-  const { filePath, parser = 'auto', minScore = 0.1, minPackets = 5 } = request.body;
+  const body = request.body || {};
+  const { filePath, parser = 'auto' } = body;
+  // Server-side type validation before spawning the Python subprocess (audit M-14).
+  const minScore = typeof body.minScore === 'number' ? body.minScore : 0.1;
+  const minPackets = Number.isInteger(body.minPackets) ? body.minPackets : 5;
+  if (!['auto', 'dpkt', 'scapy'].includes(parser)) {
+    return reply.code(400).send({ error: "parser must be 'auto', 'dpkt', or 'scapy'" });
+  }
+  if (typeof minScore !== 'number' || minScore < 0 || minScore > 1) {
+    return reply.code(400).send({ error: 'minScore must be a number in [0, 1]' });
+  }
+  if (typeof minPackets !== 'number' || minPackets < 1) {
+    return reply.code(400).send({ error: 'minPackets must be a positive integer' });
+  }
 
-  if (!filePath) {
+  if (!filePath || typeof filePath !== 'string') {
     return reply.code(400).send({ error: 'filePath is required' });
   }
 
-  // Validate file path (no traversal, correct extension, exists)
+  // Validate file path (no traversal, correct extension, exists, within allowlist)
   const pathError = validateFilePath(filePath);
   if (pathError) {
     return reply.code(400).send({ error: pathError });
@@ -113,10 +136,10 @@ app.post('/api/analyze', async (request: any, reply: any) => {
       '--parser', parser,
     ];
 
-    // ⚠ Security note: PYTHONPATH is overridden so the Python subprocess
-    // can import the engine package from the project root. This is safe for
-    // local development but the server MUST NOT be exposed publicly without
-    // auth (GHOSTWIRE_API_KEY) and proper network isolation.
+    // PYTHONPATH is overridden so the Python subprocess can import the engine
+    // package from the project root. Safe for local development; the server
+    // binds loopback by default and refuses non-loopback binding without
+    // GHOSTWIRE_API_KEY, so this is not remotely reachable without auth.
     const proc = spawn(venv, args, {
       cwd: path.join(__dirname, '..'),
       env: { ...process.env, PYTHONPATH: path.join(__dirname, '..') },
@@ -146,7 +169,7 @@ app.post('/api/analyze', async (request: any, reply: any) => {
   });
 });
 
-app.get('/api/analysis', async (request: any, reply: any) => {
+app.get('/api/analysis', async (_request: any, reply: any) => {
   if (!currentAnalysis) {
     return reply.code(404).send({ error: 'No analysis available. POST to /api/analyze first.' });
   }
@@ -157,7 +180,7 @@ app.get('/api/analysis', async (request: any, reply: any) => {
 app.register(import('@fastify/websocket'));
 
 app.register(async function (fastify) {
-  fastify.get('/ws', { websocket: true }, (connection: any, req: any) => {
+  fastify.get('/ws', { websocket: true }, (connection: any, _req: any) => {
     // Send current analysis if available
     if (currentAnalysis) {
       connection.socket.send(JSON.stringify({ type: 'analysis', data: currentAnalysis }));
@@ -175,8 +198,19 @@ app.register(async function (fastify) {
 });
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
+// Fail-closed binding (audit H-06): default to loopback. Binding a non-loopback
+// host requires GHOSTWIRE_API_KEY to be set, so the server is never
+// network-exposed AND open at the same time.
+const HOST = process.env.GHOSTWIRE_HOST || '127.0.0.1';
+const isLoopback = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1';
+if (!isLoopback && !API_KEY) {
+  console.error(`REFUSING TO START: GHOSTWIRE_HOST is non-loopback (${HOST}) but GHOSTWIRE_API_KEY is unset.`);
+  console.error('A network-exposed server with no auth is fail-open. Set GHOSTWIRE_API_KEY or bind 127.0.0.1.');
+  process.exit(1);
+}
 
-app.listen({ port: PORT, host: '0.0.0.0' }).then(() => {
-  console.log(`GHOSTWIRE API server running on http://localhost:${PORT}`);
-  console.log(`WebSocket available at ws://localhost:${PORT}/ws`);
+app.listen({ port: PORT, host: HOST }).then(() => {
+  console.log(`GHOSTWIRE API server running on http://${HOST}:${PORT}`);
+  console.log(`WebSocket available at ws://${HOST}:${PORT}/ws`);
+  console.log(`PCAP allowlist: ${ALLOWED_DIRS.join(':')}`);
 });

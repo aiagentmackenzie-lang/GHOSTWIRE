@@ -1,6 +1,6 @@
 """Tests for DNS threat detection (engine/detection/dns_threats.py)."""
 
-from engine.detection.dns_threats import analyze_dns
+from engine.detection.dns_threats import analyze_dns, detect_dga
 
 
 class TestDetectDGA:
@@ -24,6 +24,23 @@ class TestDetectDGA:
         threats = analyze_dns("google.com", "A")
         dga_threats = [t for t in threats if t.threat_type == "dga"]
         assert len(dga_threats) == 0, "google.com should not flag DGA"
+
+    def test_known_good_sld_skips_filter(self):
+        """A domain whose registrable SLD is a known-good service is skipped."""
+        # SLD label = 'amazon' (known-good) → filtered out before DGA scoring.
+        assert detect_dga("evil.amazon.com") is None
+        assert detect_dga("something.aws") is None
+
+    def test_substring_match_no_longer_skips(self):
+        """Audit M-06: a domain that merely CONTAINS a known-good substring
+        (e.g. 'aws') but whose SLD is not known-good must still be analyzed.
+        The old substring filter would skip this and hide a real DGA domain."""
+        # 'q8zaws7xk5mpl' contains the substring 'aws' but its SLD is 'evil'.
+        # Old code: any('aws' in domain) → skipped → None.
+        # New code: SLD 'evil' not known-good → analyzed → flags DGA.
+        result = detect_dga("q8zaws7xk5mpl.evil.com")
+        assert result is not None, "Substring 'aws' must not skip a non-known-good SLD"
+        assert result.threat_type == "dga"
 
     def test_very_short_domain_no_flag(self):
         """Short, normal domains should not flag."""

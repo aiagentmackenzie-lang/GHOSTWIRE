@@ -25,7 +25,7 @@ Honesty policy (audit H-03 / M-09):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +38,7 @@ class C2Match:
     match_type: str  # "ja4", "ja3", "ja4h", "ja4ssh", "http_pattern", "banner"
     matched_value: str  # The fingerprint/pattern that matched
     description: str = ""
-    mitre_techniques: list[str] = None
-
-    def __post_init__(self):
-        if self.mitre_techniques is None:
-            self.mitre_techniques = []
+    mitre_techniques: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {

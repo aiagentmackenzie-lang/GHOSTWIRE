@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -50,26 +50,14 @@ class SSHFingerprint:
     server_banner: str = ""
     ssh_version: str = ""
     client_software: str = ""
-    kex_algorithms: list[str] = None
-    host_key_algorithms: list[str] = None
-    encryption_algorithms: list[str] = None
-    mac_algorithms: list[str] = None
-    compression_algorithms: list[str] = None
+    kex_algorithms: list[str] = field(default_factory=list)
+    host_key_algorithms: list[str] = field(default_factory=list)
+    encryption_algorithms: list[str] = field(default_factory=list)
+    mac_algorithms: list[str] = field(default_factory=list)
+    compression_algorithms: list[str] = field(default_factory=list)
     source_ip: str = ""
     destination_ip: str = ""
     is_client: bool = False
-
-    def __post_init__(self):
-        if self.kex_algorithms is None:
-            self.kex_algorithms = []
-        if self.host_key_algorithms is None:
-            self.host_key_algorithms = []
-        if self.encryption_algorithms is None:
-            self.encryption_algorithms = []
-        if self.mac_algorithms is None:
-            self.mac_algorithms = []
-        if self.compression_algorithms is None:
-            self.compression_algorithms = []
 
     def to_dict(self) -> dict:
         return {

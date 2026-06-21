@@ -2,15 +2,11 @@
   "dependencies": {
     "@fastify/cors": "^11.2.0",
     "@fastify/websocket": "^11.2.0",
-    "better-sqlite3": "^12.9.0",
-    "cors": "^2.8.6",
-    "fastify": "^5.8.5",
-    "fastify-static": "^4.6.1"
+    "fastify": "^5.8.5"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
-    "@types/node": "^25.6.0",
+    "@types/node": "^22.10.0",
     "tsx": "^4.21.0",
-    "typescript": "^6.0.2"
+    "typescript": "^5.7.0"
   }
 }

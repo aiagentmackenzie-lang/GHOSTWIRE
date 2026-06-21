@@ -67,7 +67,7 @@ def _make_session_key(src_ip: str, src_port: int, dst_ip: str, dst_port: int) ->
 
 def _is_syn_only(flags: int) -> bool:
     """Check if this is a SYN-only packet (connection initiation)."""
-    return (flags & 0x02) and not (flags & 0x10)  # SYN set, ACK not set
+    return bool((flags & 0x02) and not (flags & 0x10))  # SYN set, ACK not set
 
 
 def _is_fin(flags: int) -> bool:
