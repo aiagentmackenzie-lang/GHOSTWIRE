@@ -62,6 +62,13 @@ class TestAnalyzeCommand:
         data = json.loads(stdout)
         assert data["dns_threats"] >= 1, "Should flag the long-subdomain TXT query"
 
+    def test_c2_http_pcap_fires_match(self, c2_http_pcap):
+        """The CS-UA HTTP PCAP should produce a cobalt_strike C2 match end-to-end (Phase 2 gate)."""
+        code, stdout, stderr = _run_cli("analyze", c2_http_pcap, "--output", "json")
+        assert code == 0, f"stderr: {stderr}"
+        data = json.loads(stdout)
+        assert data["c2_matches"] >= 1, "Should match the Cobalt Strike default User-Agent"
+
     def test_missing_file_returns_error(self):
         """Analyze on a missing file should return a non-zero exit code."""
         code, stdout, stderr = _run_cli("analyze", "/nonexistent/file.pcap")

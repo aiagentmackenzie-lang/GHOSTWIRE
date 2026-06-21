@@ -124,6 +124,24 @@ def _build_dns_packets():
     return [pkt]
 
 
+def _build_c2_http_packets():
+    """One TCP/HTTP GET carrying a Cobalt Strike default User-Agent.
+
+    Uses an exact, documented CS default UA so match_http fires a real
+    cobalt_strike C2 match end-to-end (Phase 2 gate).
+    """
+    ua = "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.0)"
+    req = f"GET /__init.gif HTTP/1.1\r\nHost: c2.evil.example\r\nUser-Agent: {ua}\r\n\r\n".encode()
+    pkt = (
+        Ether(src=_ETHER_SRC, dst=_ETHER_DST)
+        / IP(src="192.168.1.50", dst="185.220.101.34", ttl=64)
+        / TCP(sport=49152, dport=80, flags="PA", seq=1, ack=1)
+        / Raw(load=req)
+    )
+    pkt.time = 1.0
+    return [pkt]
+
+
 # ─── Fixtures ───────────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -151,6 +169,13 @@ def dns_pcap(tmp_path) -> str:
 def mixed_pcap(tmp_path) -> str:
     p = tmp_path / "mixed.pcap"
     wrpcap(str(p), _build_beacon_packets() + _build_tls_packets() + _build_dns_packets())
+    return str(p)
+
+
+@pytest.fixture
+def c2_http_pcap(tmp_path) -> str:
+    p = tmp_path / "c2_http.pcap"
+    wrpcap(str(p), _build_c2_http_packets())
     return str(p)
 
 

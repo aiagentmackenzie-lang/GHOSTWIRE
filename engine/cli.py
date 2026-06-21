@@ -222,6 +222,15 @@ def hunt(pcap_file: str, query: Optional[str], run_all: bool, output: str):
             result = identify_protocol(pkt.src_port, pkt.dst_port, pkt.raw_payload, pkt.protocol_l4, pkt.metadata)
             if result.l7_protocol:
                 pkt.protocol_l7 = result.l7_protocol
+                # Populate metadata so hunt queries (e.g. hunt_dns_tunneling) can
+                # read decoded protocol fields via the CLI path, not just unit tests.
+                pkt.metadata["protocol_result"] = {
+                    "tls": asdict(result.tls) if result.tls else None,
+                    "dns": asdict(result.dns) if result.dns else None,
+                    "http": asdict(result.http) if result.http else None,
+                    "ssh": asdict(result.ssh) if result.ssh else None,
+                    "icmp": asdict(result.icmp) if result.icmp else None,
+                }
 
     sessions = reconstruct_sessions(packets)
 
