@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +25,9 @@ except ImportError:
 
 _HAS_SCAPY = False
 try:
-    from scapy.all import IP as ScapyIP, TCP as ScapyTCP, Raw as ScapyRaw
+    from scapy.all import IP as ScapyIP
+    from scapy.all import TCP as ScapyTCP
+    from scapy.all import Raw as ScapyRaw
     _HAS_SCAPY = True
 except ImportError:
     pass
@@ -100,7 +101,7 @@ def _local_ja4h_hash(fp: HTTPFingerprint) -> str:
 
 
 def fingerprint_http(payload: bytes, *, src_ip: str = "", dst_ip: str = "",
-                     src_port: int = 0, dst_port: int = 0) -> Optional[HTTPFingerprint]:
+                     src_port: int = 0, dst_port: int = 0) -> HTTPFingerprint | None:
     """Extract JA4H-style fingerprint from HTTP request payload.
 
     Args:

@@ -16,7 +16,6 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +34,9 @@ except ImportError:
 
 _HAS_SCAPY = False
 try:
-    from scapy.all import IP as ScapyIP, TCP as ScapyTCP, Raw as ScapyRaw
+    from scapy.all import IP as ScapyIP
+    from scapy.all import TCP as ScapyTCP
+    from scapy.all import Raw as ScapyRaw
     _HAS_SCAPY = True
 except ImportError:
     pass
@@ -82,7 +83,7 @@ class SSHFingerprint:
         }
 
 
-def _parse_kexinit(payload: bytes) -> Optional[dict]:
+def _parse_kexinit(payload: bytes) -> dict | None:
     """Parse SSH_MSG_KEXINIT packet to extract algorithm lists."""
     if len(payload) < 6:
         return None
@@ -121,7 +122,7 @@ def _parse_kexinit(payload: bytes) -> Optional[dict]:
 
 
 def fingerprint_ssh(payload: bytes, *, src_ip: str = "", dst_ip: str = "",
-                     src_port: int = 0, dst_port: int = 0) -> Optional[SSHFingerprint]:
+                     src_port: int = 0, dst_port: int = 0) -> SSHFingerprint | None:
     """Extract SSH fingerprint from raw payload.
 
     Checks for SSH banner exchange and KEXINIT algorithm lists.

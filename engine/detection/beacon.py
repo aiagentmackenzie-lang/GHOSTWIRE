@@ -12,7 +12,6 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Optional
 
 from engine.parser.session import TCPSession
 
@@ -81,7 +80,7 @@ def _shannon_entropy(data: bytes) -> float:
     return -sum((c / length) * math.log2(c / length) for c in freq.values())
 
 
-def detect_beacon(session: TCPSession, min_packets: int = 10) -> Optional[BeaconScore]:
+def detect_beacon(session: TCPSession, min_packets: int = 10) -> BeaconScore | None:
     """Analyze a TCP session for C2 beacon patterns.
 
     Args:

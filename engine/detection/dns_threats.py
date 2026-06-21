@@ -6,7 +6,6 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +78,7 @@ def _consonant_ratio(domain: str) -> float:
     return consonants / len(label)
 
 
-def detect_dga(domain: str, query_type: str = "A") -> Optional[DNSThreat]:
+def detect_dga(domain: str, query_type: str = "A") -> DNSThreat | None:
     """Detect potential DGA-generated domain names.
 
     DGA indicators:
@@ -141,7 +140,7 @@ def detect_dga(domain: str, query_type: str = "A") -> Optional[DNSThreat]:
     return threat
 
 
-def detect_dns_tunneling(domain: str, query_type: str = "A") -> Optional[DNSThreat]:
+def detect_dns_tunneling(domain: str, query_type: str = "A") -> DNSThreat | None:
     """Detect potential DNS tunneling.
 
     DNS tunneling indicators:

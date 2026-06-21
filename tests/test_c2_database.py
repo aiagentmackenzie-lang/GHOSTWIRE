@@ -1,7 +1,12 @@
 """Tests for C2 database matching (engine/fingerprint/c2_database.py)."""
 
 from engine.fingerprint.c2_database import (
-    match_all, match_http, match_ja3, match_ja4, match_ssh, KNOWN_C2_PATTERNS,
+    KNOWN_C2_PATTERNS,
+    match_all,
+    match_http,
+    match_ja3,
+    match_ja4,
+    match_ssh,
 )
 
 

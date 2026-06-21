@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
 
 from engine.parser.pcap_loader import PacketRecord
 
@@ -126,7 +125,7 @@ def reconstruct_sessions(packets: list[PacketRecord], session_timeout: float = 3
         )
 
         # Build payload streams and track timing
-        last_time: Optional[float] = None
+        last_time: float | None = None
         client_chunks: list[bytes] = []
         server_chunks: list[bytes] = []
 

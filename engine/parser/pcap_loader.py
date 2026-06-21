@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,11 @@ except ImportError:
     logger.warning("dpkt not installed, falling back to scapy (slower for large files)")
 
 try:
-    from scapy.all import rdpcap, IP as ScapyIP, TCP as ScapyTCP, UDP as ScapyUDP, ICMP as ScapyICMP
+    from scapy.all import ICMP as ScapyICMP
+    from scapy.all import IP as ScapyIP
+    from scapy.all import TCP as ScapyTCP
+    from scapy.all import UDP as ScapyUDP
+    from scapy.all import rdpcap
 except ImportError:
     pass  # Will fail at runtime if neither available
 

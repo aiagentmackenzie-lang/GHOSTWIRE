@@ -1,8 +1,10 @@
 """Tests for JA4+/JA4H/JA4SSH fingerprinting engines."""
 
-from engine.fingerprint.ja4_engine import fingerprint_tls, fingerprint_stream, TLSFingerprint
-from engine.fingerprint.ja4h_engine import fingerprint_http, fingerprint_stream as fingerprint_http_stream
-from engine.fingerprint.ja4ssh_engine import fingerprint_ssh, fingerprint_stream as fingerprint_ssh_stream
+from engine.fingerprint.ja4_engine import TLSFingerprint, fingerprint_stream, fingerprint_tls
+from engine.fingerprint.ja4h_engine import fingerprint_http
+from engine.fingerprint.ja4h_engine import fingerprint_stream as fingerprint_http_stream
+from engine.fingerprint.ja4ssh_engine import fingerprint_ssh
+from engine.fingerprint.ja4ssh_engine import fingerprint_stream as fingerprint_ssh_stream
 from engine.parser.pcap_loader import PacketRecord
 from engine.parser.protocol import decode_tls
 

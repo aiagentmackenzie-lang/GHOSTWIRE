@@ -6,7 +6,6 @@ import logging
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +98,11 @@ class ICMPInfo:
 class ProtocolResult:
     """Complete protocol decode result."""
     l7_protocol: str = ""
-    tls: Optional[TLSInfo] = None
-    dns: Optional[DNSInfo] = None
-    http: Optional[HTTPInfo] = None
-    ssh: Optional[SSHInfo] = None
-    icmp: Optional[ICMPInfo] = None
+    tls: TLSInfo | None = None
+    dns: DNSInfo | None = None
+    http: HTTPInfo | None = None
+    ssh: SSHInfo | None = None
+    icmp: ICMPInfo | None = None
 
 
 def _shannon_entropy(data: bytes) -> float:
@@ -118,7 +117,7 @@ def _shannon_entropy(data: bytes) -> float:
     return -sum((c / length) * math.log2(c / length) for c in freq.values())
 
 
-def decode_tls(payload: bytes) -> Optional[TLSInfo]:
+def decode_tls(payload: bytes) -> TLSInfo | None:
     """Decode TLS handshake from raw payload."""
     if len(payload) < 5:
         return None
@@ -190,7 +189,7 @@ def decode_tls(payload: bytes) -> Optional[TLSInfo]:
     return info
 
 
-def decode_dns(payload: bytes) -> Optional[DNSInfo]:
+def decode_dns(payload: bytes) -> DNSInfo | None:
     """Decode DNS message from raw payload."""
     if len(payload) < 12:
         return None
@@ -228,7 +227,7 @@ def decode_dns(payload: bytes) -> Optional[DNSInfo]:
     return info
 
 
-def decode_http(payload: bytes) -> Optional[HTTPInfo]:
+def decode_http(payload: bytes) -> HTTPInfo | None:
     """Decode HTTP request or response from raw payload."""
     if not payload:
         return None
@@ -280,7 +279,7 @@ def decode_http(payload: bytes) -> Optional[HTTPInfo]:
     return info
 
 
-def decode_ssh(payload: bytes) -> Optional[SSHInfo]:
+def decode_ssh(payload: bytes) -> SSHInfo | None:
     """Decode SSH protocol from raw payload."""
     if not payload:
         return None
@@ -302,7 +301,7 @@ def decode_ssh(payload: bytes) -> Optional[SSHInfo]:
     return None
 
 
-def decode_icmp(payload: bytes, icmp_type: int = 0, icmp_code: int = 0) -> Optional[ICMPInfo]:
+def decode_icmp(payload: bytes, icmp_type: int = 0, icmp_code: int = 0) -> ICMPInfo | None:
     """Decode ICMP and detect potential tunneling."""
     if not payload:
         return None

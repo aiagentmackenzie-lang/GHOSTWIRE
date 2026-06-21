@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import math
 import logging
-from typing import Callable
+import math
+from collections.abc import Callable
 
 from engine.parser.pcap_loader import PacketRecord
 from engine.parser.session import TCPSession
@@ -312,7 +312,7 @@ def run_all_hunts(sessions: list[TCPSession], packets: list[PacketRecord]) -> di
     """
     all_results: dict[str, list[dict]] = {}
 
-    for name, meta in BUILTIN_QUERIES.items():
+    for name, _meta in BUILTIN_QUERIES.items():
         results = run_hunt(name, sessions, packets)
         if results:
             all_results[name] = results

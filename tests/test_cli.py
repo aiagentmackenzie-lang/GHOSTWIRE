@@ -8,7 +8,6 @@ import json
 import subprocess
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python3"
 
@@ -47,6 +46,13 @@ class TestAnalyzeCommand:
         assert code == 0, f"stderr: {stderr}"
         data = json.loads(stdout)
         assert data["beacons_detected"] >= 1, "Should detect the steady-interval beacon"
+        # Audit H-04 gate: a textbook beacon (jitter ≈ 0) must reach HIGH, not LOW.
+        threats = data["threats"]
+        assert threats, "Beacon should produce a threat score above min-score"
+        top = max(threats, key=lambda t: t["overall_score"])
+        assert top["confidence"] == "HIGH", (
+            f"Textbook beacon should reach HIGH, got {top['confidence']} ({top['overall_score']})"
+        )
 
     def test_tls_pcap_produces_fingerprint(self, tls_pcap):
         """The ClientHello PCAP should produce at least one TLS fingerprint."""

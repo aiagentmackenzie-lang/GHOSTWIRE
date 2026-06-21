@@ -21,7 +21,7 @@ from __future__ import annotations
 import struct
 
 import pytest
-from scapy.all import Ether, IP, TCP, UDP, Raw, wrpcap
+from scapy.all import IP, TCP, UDP, Ether, Raw, wrpcap
 
 # scapy writes raw-IP packets with DLT_RAW, which dpkt's Ethernet reader can't
 # frame. Wrapping in Ether() yields a standard Ethernet-encapsulated PCAP that
@@ -33,17 +33,39 @@ _ETHER_DST = "66:77:88:99:aa:bb"
 # ─── Builders ───────────────────────────────────────────────────────────────
 
 def _build_beacon_packets():
-    """25 unidirectional TCP packets at a steady 60s interval → jitter ≈ 0."""
+    """A realistic C2 beacon: request/response pairs at a steady 60s interval.
+
+    - 25 intervals (50 packets): small 24-byte encrypted request > ~300-byte
+      response, 0.5s apart within a pair, 60s between pairs.
+    - Random payloads > high Shannon entropy (> 7.5) → entropy_score.
+    - Volume ratio ~0.07 → volume_score 0.6 (asymmetric).
+    - Inter-arrival (response→next-request) = 59.5s with zero variance →
+      jitter ≈ 0 → jitter_score 0.95.
+    - duration 1440s, 50 packets, ~0.035 pkt/s → regularity_score 0.7.
+    Composite beacon score ≈ 0.75 → HIGH, which exercises the strong-beacon
+    floor in the composite scorer (audit H-04).
+    """
+    import os
     pkts = []
     for i in range(25):
-        pkt = (
+        t = float(i * 60.0)
+        # Client → server: small encrypted request (24 random bytes)
+        req = (
             Ether(src=_ETHER_SRC, dst=_ETHER_DST)
             / IP(src="192.168.1.50", dst="185.220.101.34", ttl=64)
-            / TCP(sport=49152, dport=443, flags="PA", seq=i * 100, ack=1)
-            / Raw(load=bytes([0x41 + (i % 26)] * 80))
+            / TCP(sport=49152, dport=443, flags="PA", seq=i * 1000, ack=i * 1000)
+            / Raw(load=os.urandom(24))
         )
-        pkt.time = float(i * 60.0)  # 0, 60, 120, ... 1440 seconds
-        pkts.append(pkt)
+        req.time = t
+        # Server → client: larger response (300 random bytes)
+        resp = (
+            Ether(src=_ETHER_DST, dst=_ETHER_SRC)
+            / IP(src="185.220.101.34", dst="192.168.1.50", ttl=64)
+            / TCP(sport=443, dport=49152, flags="PA", seq=i * 1000, ack=i * 1000 + 24)
+            / Raw(load=os.urandom(300))
+        )
+        resp.time = t + 0.5
+        pkts.extend([req, resp])
     return pkts
 
 

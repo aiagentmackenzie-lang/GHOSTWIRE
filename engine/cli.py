@@ -14,30 +14,38 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
 
 import click
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
+from rich.table import Table
 
-from scapy.all import Scapy_Exception
+# scapy is an optional fast-path dependency (pcap_loader falls back to dpkt).
+# Import Scapy_Exception lazily so the CLI still starts when scapy is absent;
+# define a fallback exception class for the except clauses below.
+try:
+    from scapy.all import Scapy_Exception as _ScapyException
+except ImportError:
+    class _ScapyException(Exception):
+        """Fallback so `except (ValueError, Scapy_Exception)` is valid without scapy."""
+
+Scapy_Exception = _ScapyException
 
 from engine import __version__
-from engine.parser.pcap_loader import load_pcap
-from engine.parser.protocol import identify_protocol
-from engine.parser.session import reconstruct_sessions
+from engine.detection.beacon import detect_beacons
+from engine.detection.dns_threats import DNSThreat, analyze_dns
+from engine.detection.hunt import BUILTIN_QUERIES, run_all_hunts, run_hunt
+from engine.detection.scorer import score_session
+from engine.export.mitre_map import map_analysis_to_attack
+from engine.export.report import generate_markdown_report, generate_text_report, save_report
+from engine.export.stix import build_stix_bundle, iocs_from_analysis
+from engine.fingerprint.c2_database import match_all
 from engine.fingerprint.ja4_engine import fingerprint_stream as tls_fingerprint
 from engine.fingerprint.ja4h_engine import fingerprint_stream as http_fingerprint
 from engine.fingerprint.ja4ssh_engine import fingerprint_stream as ssh_fingerprint
-from engine.fingerprint.c2_database import match_all
-from engine.detection.beacon import detect_beacons
-from engine.detection.dns_threats import analyze_dns, DNSThreat
-from engine.detection.scorer import score_session
-from engine.detection.hunt import BUILTIN_QUERIES, run_hunt, run_all_hunts
-from engine.export.stix import build_stix_bundle, iocs_from_analysis
-from engine.export.report import generate_markdown_report, generate_text_report, save_report
-from engine.export.mitre_map import map_analysis_to_attack
+from engine.parser.pcap_loader import load_pcap
+from engine.parser.protocol import identify_protocol
+from engine.parser.session import reconstruct_sessions
 
 console = Console()
 logger = logging.getLogger("ghostwire")
@@ -203,7 +211,7 @@ def analyze(pcap_file: str, output: str, parser: str, min_score: float, min_pack
               help="Run a specific hunt query")
 @click.option("--all", "run_all", is_flag=True, help="Run all hunt queries")
 @click.option("--output", "-o", type=click.Choice(["json", "summary"]), default="summary")
-def hunt(pcap_file: str, query: Optional[str], run_all: bool, output: str):
+def hunt(pcap_file: str, query: str | None, run_all: bool, output: str):
     """Hunt for threats using predefined queries."""
 
     try:
@@ -278,7 +286,7 @@ def hunt(pcap_file: str, query: Optional[str], run_all: bool, output: str):
               help="Minimum threat score to report (0.0-1.0)")
 @click.option("--min-packets", type=int, default=10,
               help="Minimum packets per session for beacon analysis")
-def report(pcap_file: str, fmt: str, output_file: Optional[str], min_score: float, min_packets: int):
+def report(pcap_file: str, fmt: str, output_file: str | None, min_score: float, min_packets: int):
     """Generate threat analysis report."""
 
     try:

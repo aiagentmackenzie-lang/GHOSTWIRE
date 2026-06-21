@@ -21,7 +21,6 @@ import hashlib
 import logging
 import struct
 from dataclasses import dataclass
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +35,9 @@ except ImportError:
 
 _HAS_SCAPY = False
 try:
-    from scapy.all import IP as ScapyIP, TCP as ScapyTCP, Raw as ScapyRaw
+    from scapy.all import IP as ScapyIP
+    from scapy.all import TCP as ScapyTCP
+    from scapy.all import Raw as ScapyRaw
     _HAS_SCAPY = True
 except ImportError:
     pass  # JA4S path degrades; JA4 dict path still works
@@ -74,7 +75,7 @@ class TLSFingerprint:
 
 # ─── Manual parsing helpers (used by JA3 fallback + SNI when ja4plus absent) ──
 
-def _walk_client_hello(payload: bytes) -> Optional[dict]:
+def _walk_client_hello(payload: bytes) -> dict | None:
     """Parse a TLS ClientHello into structured fields.
 
     Offsets (TLS record = content_type(1) + version(2) + length(2) = 5 bytes;
@@ -198,7 +199,7 @@ def _scapy_packet_from_payload(payload: bytes, src_ip: str, dst_ip: str,
 
 
 def fingerprint_tls(payload: bytes, *, src_ip: str = "", dst_ip: str = "",
-                     src_port: int = 0, dst_port: int = 0) -> Optional[TLSFingerprint]:
+                     src_port: int = 0, dst_port: int = 0) -> TLSFingerprint | None:
     """Extract JA4+/JA3 fingerprints from a TLS handshake payload.
 
     Args:
