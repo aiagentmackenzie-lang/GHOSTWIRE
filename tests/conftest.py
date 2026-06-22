@@ -21,7 +21,7 @@ from __future__ import annotations
 import struct
 
 import pytest
-from scapy.all import IP, TCP, UDP, Ether, Raw, wrpcap
+from scapy.all import IP, TCP, UDP, Ether, IPv6, Raw, wrpcap
 
 # scapy writes raw-IP packets with DLT_RAW, which dpkt's Ethernet reader can't
 # frame. Wrapping in Ether() yields a standard Ethernet-encapsulated PCAP that
@@ -267,6 +267,56 @@ def _build_benign_browsing_packets():
     return pkts
 
 
+def _build_ipv6_beacon_packets():
+    """A C2 beacon over IPv6 to an external address (2001:db8:dead::beef).
+
+    25 request/response pairs at a steady 60s interval — same shape as the
+    IPv4 beacon but exercising the IPv6 parse path (dpkt.ip6.IP6 / scapy IPv6)
+    and IPv6 private-range detection in hunt._is_private_ip. The destination is
+    global-scope (not fc00::/7 / fe80::/10 / ::1), so it should be classified
+    external and the beacon flagged. (production-plan Phase 2.1)
+    """
+    import os
+    pkts = []
+    for i in range(25):
+        ts = float(i * 60.0)
+        req = (
+            Ether(src=_ETHER_SRC, dst=_ETHER_DST)
+            / IPv6(src="fd00::50", dst="2001:db8:dead::beef", hlim=64)
+            / TCP(sport=49152, dport=443, flags="PA", seq=i * 1000, ack=i * 1000)
+            / Raw(load=os.urandom(24))
+        )
+        req.time = ts
+        resp = (
+            Ether(src=_ETHER_DST, dst=_ETHER_SRC)
+            / IPv6(src="2001:db8:dead::beef", dst="fd00::50", hlim=64)
+            / TCP(sport=443, dport=49152, flags="PA", seq=i * 1000, ack=i * 1000 + 24)
+            / Raw(load=os.urandom(300))
+        )
+        resp.time = ts + 0.5
+        pkts.extend([req, resp])
+    return pkts
+
+
+def _build_ipv6_dns_packets():
+    """A benign-looking but long-label TXT DNS query over IPv6 transport.
+
+    The DNS query itself is the tunneling signal (long hex subdomain + TXT); the
+    IPv6 transport (client fd00::50 -> resolver 2001:4860:4860::8888) exercises
+    the IPv6 UDP parse path. Should produce a DNS threat. (Phase 2.1)
+    """
+    domain = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4.evil6.com"
+    payload = _build_dns_query(domain, qtype=16)  # 16 = TXT
+    pkt = (
+        Ether(src=_ETHER_SRC, dst=_ETHER_DST)
+        / IPv6(src="fd00::50", dst="2001:4860:4860::8888", hlim=64)
+        / UDP(sport=33333, dport=53)
+        / Raw(load=payload)
+    )
+    pkt.time = 1.0
+    return [pkt]
+
+
 # ─── Fixtures ───────────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -313,6 +363,20 @@ def benign_pcap(tmp_path) -> str:
     """
     p = tmp_path / "benign_browsing.pcap"
     wrpcap(str(p), _build_benign_browsing_packets())
+    return str(p)
+
+
+@pytest.fixture
+def ipv6_beacon_pcap(tmp_path) -> str:
+    p = tmp_path / "ipv6_beacon.pcap"
+    wrpcap(str(p), _build_ipv6_beacon_packets())
+    return str(p)
+
+
+@pytest.fixture
+def ipv6_dns_pcap(tmp_path) -> str:
+    p = tmp_path / "ipv6_dns.pcap"
+    wrpcap(str(p), _build_ipv6_dns_packets())
     return str(p)
 
 

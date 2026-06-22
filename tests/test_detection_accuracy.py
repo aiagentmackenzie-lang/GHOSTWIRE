@@ -92,3 +92,25 @@ class TestKnownPositiveCorpus:
         assert code == 0, f"stderr: {stderr}"
         data = json.loads(stdout)
         assert data["c2_matches"] >= 1, "FALSE NEGATIVE: Cobalt Strike UA not matched"
+
+
+class TestIPv6Corpus:
+    """IPv6 traffic must parse and detect (production-plan Phase 2.1)."""
+
+    def test_ipv6_beacon_detected(self, ipv6_beacon_pcap):
+        """An IPv6 steady-interval beacon must be flagged — exercises IPv6 parse
+        + IPv6 external classification in hunt._is_private_ip."""
+        code, stdout, stderr = _run_cli("analyze", ipv6_beacon_pcap, "--output", "json")
+        assert code == 0, f"stderr: {stderr}"
+        data = json.loads(stdout)
+        assert data["beacons_detected"] >= 1, (
+            f"IPv6 beacon not detected (sessions={data['sessions_total']}, "
+            f"packets={data['packets_total']})"
+        )
+
+    def test_ipv6_dns_threat_detected(self, ipv6_dns_pcap):
+        """An IPv6-transported long-label TXT DNS query must flag a threat."""
+        code, stdout, stderr = _run_cli("analyze", ipv6_dns_pcap, "--output", "json")
+        assert code == 0, f"stderr: {stderr}"
+        data = json.loads(stdout)
+        assert data["dns_threats"] >= 1, "IPv6 DNS tunneling not detected"
