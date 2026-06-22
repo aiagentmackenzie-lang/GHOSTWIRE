@@ -1,18 +1,57 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import rateLimit from '@fastify/rate-limit';
 import { spawn } from 'child_process';
 import path from 'path';
 import fs from 'fs';
+import { pathToFileURL } from 'url';
 
-const app = Fastify({ logger: false });
+// ─── Server safety limits (env-configurable) ──────────────────────────────
+// bodyLimit caps request body size (JSON metadata, not the PCAP itself —
+// PCAPs are referenced by path, not uploaded). requestTimeout/handlerTimeout
+// bound how long we hold a connection / run a handler before tearing it down.
+const BODY_LIMIT = Number(process.env.GHOSTWIRE_BODY_LIMIT_BYTES || (1 << 20)); // 1 MiB
+const REQUEST_TIMEOUT_MS = Number(process.env.GHOSTWIRE_REQUEST_TIMEOUT_MS || 30_000);
+const HANDLER_TIMEOUT_MS = Number(process.env.GHOSTWIRE_HANDLER_TIMEOUT_MS || 300_000);
+
+// Max PCAP size we will analyze. Default 500 MiB — a SPAN capture bigger than
+// this almost certainly means the operator should be slicing it up, and we
+// refuse to OOM the server on it. (production-plan Phase 1.2)
+function getMaxPcapBytes(): number {
+  return Number(process.env.GHOSTWIRE_MAX_PCAP_BYTES || (500 * (1 << 20)));
+}
+
+// Subprocess analysis timeout. Default 240s. On expiry: SIGTERM, then SIGKILL
+// after 5s if still alive, and we return 504. (production-plan Phase 1.3)
+function getAnalysisTimeoutMs(): number {
+  return Number(process.env.GHOSTWIRE_ANALYSIS_TIMEOUT_MS || 240_000);
+}
+const KILL_GRACE_MS = 5_000;
+
+// Rate limit on /api/analyze (per-IP). (production-plan Phase 1.4)
+function getRateMax(): number {
+  return Number(process.env.GHOSTWIRE_RATE_MAX || 20);
+}
+function getRateWindow(): string {
+  return process.env.GHOSTWIRE_RATE_WINDOW || '1 minute';
+}
+
+const app = Fastify({
+  logger: false,
+  bodyLimit: BODY_LIMIT,
+  requestTimeout: REQUEST_TIMEOUT_MS,
+  handlerTimeout: HANDLER_TIMEOUT_MS,
+});
 
 app.register(cors, { origin: true });
+app.register(rateLimit, {
+  global: false, // opt-in per route; health + ws stay unthrottled
+  max: getRateMax(),
+  timeWindow: getRateWindow(),
+});
 
 // Health check endpoint
 app.get('/health', async () => ({ status: 'ok', version: '0.1.0' }));
-
-// Store analysis results in memory (simple approach for now)
-let currentAnalysis: any = null;
 
 // ─── Auth middleware ──────────────────────────────────────────────────────
 // If GHOSTWIRE_API_KEY is set, require Authorization: Bearer <key>.
@@ -56,13 +95,19 @@ const ALLOWED_EXTENSIONS = ['.pcap', '.pcapng', '.cap'];
 // GHOSTWIRE_ALLOWED_DIRS=/path/a:/path/b. (audit H-06)
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const DEFAULT_ALLOWED_DIR = path.join(PROJECT_ROOT, 'samples');
-const ALLOWED_DIRS = (process.env.GHOSTWIRE_ALLOWED_DIRS || '')
-    .split(':')
-    .map((d) => d.trim())
-    .filter(Boolean)
-    .map((d) => path.resolve(d));
-if (ALLOWED_DIRS.length === 0) {
-  ALLOWED_DIRS.push(DEFAULT_ALLOWED_DIR);
+// Resolved per-request so tests/operators can reconfigure without a restart
+// (ESM imports hoist above test setup, so module-load resolution would miss
+// fixture dirs set in before()).
+function getAllowedDirs(): string[] {
+  const dirs = (process.env.GHOSTWIRE_ALLOWED_DIRS || '')
+      .split(':')
+      .map((d) => d.trim())
+      .filter(Boolean)
+      .map((d) => path.resolve(d));
+  if (dirs.length === 0) {
+    dirs.push(DEFAULT_ALLOWED_DIR);
+  }
+  return dirs;
 }
 
 function validateFilePath(filePath: string): string | null {
@@ -75,7 +120,7 @@ function validateFilePath(filePath: string): string | null {
   }
 
   // Restrict to the configured allowlist (fail-closed: default = samples/).
-  const allowed = ALLOWED_DIRS.some(
+  const allowed = getAllowedDirs().some(
     (dir) => resolved.startsWith(dir + path.sep) || resolved === dir,
   );
   if (!allowed) {
@@ -98,7 +143,32 @@ function validateFilePath(filePath: string): string | null {
   return null; // valid
 }
 
-app.post('/api/analyze', async (request: any, reply: any) => {
+// Max-PCAP-size pre-check. Returns the byte size, or an error string if the
+// file exceeds GHOSTWIRE_MAX_PCAP_BYTES. Kept separate from validateFilePath
+// because the failure mode (413) differs from a path error (400). (Phase 1.2)
+// Exported for direct unit testing.
+export function checkPcapSize(filePath: string, maxBytes?: number): { size: number } | { error: string } {
+  const resolved = path.resolve(filePath);
+  const cap = maxBytes ?? getMaxPcapBytes();
+  try {
+    const size = fs.statSync(resolved).size;
+    if (size > cap) {
+      return {
+        error: `File too large: ${(size / (1 << 20)).toFixed(1)} MiB exceeds limit ${(cap / (1 << 20)).toFixed(0)} MiB. Configure GHOSTWIRE_MAX_PCAP_BYTES to raise it.`,
+      };
+    }
+    return { size };
+  } catch {
+    return { error: `Cannot stat file: ${resolved}` };
+  }
+}
+
+export { app };
+
+app.post('/api/analyze', {
+  // Rate-limit only the heavy endpoint; health + ws stay open. (Phase 1.4)
+  config: { rateLimit: { max: getRateMax(), timeWindow: getRateWindow() } },
+}, async (request: any, reply: any) => {
   const body = request.body || {};
   const { filePath, parser = 'auto' } = body;
   // Server-side type validation before spawning the Python subprocess (audit M-14).
@@ -124,9 +194,19 @@ app.post('/api/analyze', async (request: any, reply: any) => {
     return reply.code(400).send({ error: pathError });
   }
 
+  // Max-size pre-check BEFORE spawning — refuse oversized captures with 413.
+  const sizeCheck = checkPcapSize(filePath);
+  if ('error' in sizeCheck) {
+    return reply.code(413).send({ error: sizeCheck.error });
+  }
+
+  const analysisTimeoutMs = getAnalysisTimeoutMs();
+
   // Run ghostwire CLI and capture JSON output
   return new Promise((resolve) => {
-    const venv = path.join(__dirname, '..', '.venv', 'bin', 'python3');
+    // GHOSTWIRE_PYTHON_BIN overrides the hardcoded venv path so operators
+    // (and tests) can point at any interpreter. Defaults to the project venv.
+    const venv = process.env.GHOSTWIRE_PYTHON_BIN || path.join(__dirname, '..', '.venv', 'bin', 'python3');
     const args = [
       '-m', 'engine.cli',
       'analyze', filePath,
@@ -147,28 +227,66 @@ app.post('/api/analyze', async (request: any, reply: any) => {
 
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    let timedOut = false;
+    let killTimer: NodeJS.Timeout | undefined;
+
+    // Settle once: clear timers, reap the process, run the reply fn.
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
+      try { proc.kill(); } catch { /* already dead */ }
+      fn();
+    };
+
+    // Subprocess timeout → SIGTERM, then SIGKILL after grace, then 504.
+    // (production-plan Phase 1.3)
+    const timer = setTimeout(() => {
+      if (settled) return;
+      timedOut = true;
+      console.error(`[GHOSTWIRE] Analysis timeout (${analysisTimeoutMs}ms) for ${filePath}; sending SIGTERM`);
+      try { proc.kill('SIGTERM'); } catch { /* dead */ }
+      killTimer = setTimeout(() => {
+        console.error(`[GHOSTWIRE] Process did not exit after SIGTERM; sending SIGKILL`);
+        try { proc.kill('SIGKILL'); } catch { /* dead */ }
+      }, KILL_GRACE_MS);
+    }, analysisTimeoutMs);
 
     proc.stdout.on('data', (data: Buffer) => { stdout += data.toString(); });
     proc.stderr.on('data', (data: Buffer) => { stderr += data.toString(); });
 
+    proc.on('error', (err: Error) => {
+      console.error(`[GHOSTWIRE] Spawn error: ${err.message}`);
+      finish(() => resolve(reply.code(500).send({ error: 'Failed to start analysis. Check server logs.' })));
+    });
+
     proc.on('close', (code: number) => {
+      // Timeout path wins over exit code: a SIGTERM-killed process exits
+      // non-zero, but the operator wants 504, not a generic 500.
+      if (timedOut) {
+        finish(() => resolve(reply.code(504).send({ error: 'Analysis timed out. Increase GHOSTWIRE_ANALYSIS_TIMEOUT_MS or analyze a smaller capture.' })));
+        return;
+      }
       if (code !== 0) {
         // Sanitize: log full stderr server-side, send generic error to client
         console.error(`[GHOSTWIRE] Analysis failed (exit ${code}): ${stderr}`);
-        resolve(reply.code(500).send({ error: 'Analysis failed. Check server logs for details.' }));
+        finish(() => resolve(reply.code(500).send({ error: 'Analysis failed. Check server logs for details.' })));
         return;
       }
-
       try {
-        currentAnalysis = JSON.parse(stdout);
-        resolve(reply.send(currentAnalysis));
+        finish(() => resolve(reply.send(JSON.parse(stdout))));
       } catch {
-        resolve(reply.code(500).send({ error: 'Failed to parse analysis output' }));
+        finish(() => resolve(reply.code(500).send({ error: 'Failed to parse analysis output' })));
       }
     });
   });
 });
 
+// In-memory analysis result cache (legacy single-slot). Phase 3 replaces
+// this with the SQLite job store; kept for now so /api/analysis still works.
+let currentAnalysis: any = null;
 app.get('/api/analysis', async (_request: any, reply: any) => {
   if (!currentAnalysis) {
     return reply.code(404).send({ error: 'No analysis available. POST to /api/analyze first.' });
@@ -209,8 +327,15 @@ if (!isLoopback && !API_KEY) {
   process.exit(1);
 }
 
-app.listen({ port: PORT, host: HOST }).then(() => {
+async function start() {
+  await app.listen({ port: PORT, host: HOST });
   console.log(`GHOSTWIRE API server running on http://${HOST}:${PORT}`);
   console.log(`WebSocket available at ws://${HOST}:${PORT}/ws`);
-  console.log(`PCAP allowlist: ${ALLOWED_DIRS.join(':')}`);
-});
+  console.log(`PCAP allowlist: ${getAllowedDirs().join(':')}`);
+  console.log(`Limits: body=${(BODY_LIMIT / (1 << 20)).toFixed(1)}MiB, max-pcap=${(getMaxPcapBytes() / (1 << 20)).toFixed(0)}MiB, analysis-timeout=${(getAnalysisTimeoutMs() / 1000).toFixed(0)}s, rate=${getRateMax()}/${getRateWindow()}`);
+}
+
+// Run only when executed directly (not imported by a test).
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  start();
+}
