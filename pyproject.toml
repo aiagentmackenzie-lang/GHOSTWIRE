@@ -22,12 +22,17 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 dependencies = [
     "scapy>=2.6",
     "dpkt>=1.9.8",
-    "ja4plus>=0.4",
+    # ja4plus: pin to a compatible range — a major bump could change the
+    # parse_tls_handshake dict shape (keys: type/sni/ciphers/extensions/
+    # supported_versions/version) that ja4_engine.py reads. Bump only after
+    # re-verifying those keys in tests/test_fingerprint.py.
+    "ja4plus>=0.5,<0.6",
     "rich>=13.0",
     "click>=8.0",
 ]
