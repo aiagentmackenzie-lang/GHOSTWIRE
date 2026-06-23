@@ -49,3 +49,16 @@ jobs:
       # Server lives at repo root (package.json deps: fastify, @fastify/*).
       - run: npm ci
       - run: npx tsc --noEmit -p tsconfig.json
+
+  server-test:
+    # Node-side job store / audit / async-analysis tests (Phase 3).
+    # better-sqlite3 ships prebuilt binaries for ubuntu x86-64.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm test
