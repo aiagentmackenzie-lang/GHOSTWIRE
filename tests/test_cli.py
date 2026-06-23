@@ -6,15 +6,17 @@ fresh clone with no binary samples committed.
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python3"
+# Use sys.executable so tests work in CI (no .venv) and locally (.venv).
+PYTHON_BIN = sys.executable
 
 
 def _run_cli(*args, timeout=30):
     """Run the GHOSTWIRE CLI and return (returncode, stdout, stderr)."""
-    cmd = [str(VENV_PYTHON), "-m", "engine.cli"] + list(args)
+    cmd = [PYTHON_BIN, "-m", "engine.cli"] + list(args)
     result = subprocess.run(
         cmd,
         capture_output=True,
