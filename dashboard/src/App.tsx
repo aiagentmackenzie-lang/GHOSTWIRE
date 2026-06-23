@@ -41,15 +41,55 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [filePath, setFilePath] = useState('')
 
-  // API base + optional bearer token (Phase 6.2). Defaults to same-origin so
-  // the dashboard served by the server (Phase 5) just works; in dev, set
-  // VITE_API_BASE=http://localhost:3001 in dashboard/.env.
+  // API key: operator-entered, stored in browser localStorage (v0.2.1). The
+  // key is NEVER baked into the JS bundle — that would ship the secret to
+  // anyone who loads /, defeating API auth. VITE_API_TOKEN is kept ONLY as a
+  // local-dev convenience so a developer can skip the prompt.
+  //
+  // XSS note: storing the key in localStorage exposes it to XSS. Acceptable
+  // here because the dashboard ships no third-party JS and never sets
+  // innerHTML from user/network input. An httpOnly-cookie session is the
+  // harder bar (roadmap, not v0.2.1).
+  const STORAGE_KEY = 'ghostwire_api_key'
+  const [apiKey, setApiKey] = useState<string>(
+    () => localStorage.getItem(STORAGE_KEY) || ''
+  )
+  const [keyInput, setKeyInput] = useState('')
+  const hasKey =
+    Boolean(apiKey) || Boolean(import.meta.env.VITE_API_TOKEN as string | undefined)
+
+  // API base. Defaults to same-origin so the dashboard served by the server
+  // (Phase 5) just works; in dev, set VITE_API_BASE=http://localhost:3001.
   const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
   const authHeaders = (): Record<string, string> => {
-    const t = import.meta.env.VITE_API_TOKEN as string | undefined
+    const t = apiKey || (import.meta.env.VITE_API_TOKEN as string | undefined)
     return t ? { Authorization: `Bearer ${t}` } : {}
   }
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+  const connectKey = () => {
+    const k = keyInput.trim()
+    if (!k) return
+    localStorage.setItem(STORAGE_KEY, k)
+    setApiKey(k)
+    setKeyInput('')
+    setError(null)
+  }
+
+  const clearKey = () => {
+    localStorage.removeItem(STORAGE_KEY)
+    setApiKey('')
+    setError(null)
+  }
+
+  // A 401 means the stored/entered key is wrong or expired: drop it, stop
+  // loading, and surface the prompt again with a clear message.
+  const handle401 = (msg: string) => {
+    localStorage.removeItem(STORAGE_KEY)
+    setApiKey('')
+    setError(msg)
+    setLoading(false)
+  }
 
   const runAnalysis = useCallback(async (path: string) => {
     setLoading(true)
@@ -62,6 +102,10 @@ function App() {
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ filePath: path }),
       })
+      if (res.status === 401) {
+        handle401('Invalid or expired API key. Re-enter the key.')
+        return
+      }
       const data = await res.json()
       if (!res.ok || data.error) {
         setError(data.error || `Analysis rejected (${res.status})`)
@@ -73,6 +117,10 @@ function App() {
       while (Date.now() < deadline) {
         await sleep(1000)
         const jr = await fetch(`${API_BASE}/api/jobs/${jobId}`, { headers: authHeaders() })
+        if (jr.status === 401) {
+          handle401('Invalid or expired API key. Re-enter the key.')
+          return
+        }
         const job = await jr.json()
         if (job.status === 'completed') {
           setAnalysis(job.summary)
@@ -91,12 +139,12 @@ function App() {
       setError('Failed to connect to GHOSTWIRE API. Is the server running?')
       setLoading(false)
     }
-  }, [API_BASE])
+  }, [API_BASE, apiKey])
 
   // Load demo data
   const loadDemo = useCallback(() => {
     setAnalysis({
-      ghostwire_version: '0.2.0',
+      ghostwire_version: '0.2.1',
       file: 'samples/c2_beacon_test.pcap',
       analysis_time: 0.02,
       packets_total: 110,
@@ -163,7 +211,7 @@ function App() {
             GHOSTWIRE
           </h1>
           <p style={{ fontSize: '12px', color: 'var(--text-dim)', fontFamily: 'var(--font-mono)' }}>
-            Network Forensics Engine v0.2.0
+            Network Forensics Engine v0.2.1
           </p>
         </div>
 
@@ -202,8 +250,64 @@ function App() {
           >
             Demo
           </button>
+          {hasKey && (
+            <button
+              onClick={clearKey}
+              title="Clear the stored API key and sign out"
+              style={{
+                background: 'transparent', color: 'var(--text-dim)',
+                padding: '8px 12px', borderRadius: '6px', border: '1px solid var(--border)',
+                fontSize: '12px', cursor: 'pointer',
+              }}
+            >
+              Clear key
+            </button>
+          )}
         </div>
       </header>
+
+      {/* API key prompt (v0.2.1) — shown when no key is set. */}
+      {!hasKey && (
+        <div style={{
+          background: 'var(--surface)', border: '1px solid var(--border)',
+          borderRadius: '8px', padding: '20px', marginBottom: '20px',
+          maxWidth: '480px', margin: '0 auto 20px',
+        }}>
+          <h2 style={{ fontSize: '16px', color: 'var(--text)', marginBottom: '8px' }}>
+            API key required
+          </h2>
+          <p style={{ fontSize: '13px', color: 'var(--text-dim)', marginBottom: '16px' }}>
+            Enter the GHOSTWIRE API key to analyze PCAPs. The key is stored in your
+            browser only; it is never baked into the dashboard bundle.
+          </p>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <input
+              type="password"
+              placeholder="API key..."
+              value={keyInput}
+              onChange={(e) => setKeyInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && connectKey()}
+              style={{
+                flex: 1, background: 'var(--bg)', border: '1px solid var(--border)',
+                color: 'var(--text)', padding: '8px 12px', borderRadius: '6px',
+                fontSize: '13px', fontFamily: 'var(--font-mono)',
+              }}
+            />
+            <button
+              onClick={connectKey}
+              disabled={!keyInput.trim()}
+              style={{
+                background: 'var(--primary)', color: 'var(--bg)',
+                padding: '8px 16px', borderRadius: '6px', border: 'none',
+                fontWeight: 600, fontSize: '13px', cursor: 'pointer',
+                opacity: keyInput.trim() ? 1 : 0.5,
+              }}
+            >
+              Connect
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Error */}
       {error && (

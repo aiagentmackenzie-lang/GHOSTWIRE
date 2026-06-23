@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { app, checkPcapSize, getJobs, _resetState } from './index.js';
+import { app, checkPcapSize, getJobs, _resetState, _resetAuth } from './index.js';
 
 const FIXTURE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-fixtures-'));
 const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-data-'));
@@ -30,6 +30,8 @@ afterEach(() => {
   delete process.env.GHOSTWIRE_PYTHON_BIN;
   delete process.env.GHOSTWIRE_RATE_MAX;
   delete process.env.GHOSTWIRE_RATE_WINDOW;
+  delete process.env.GHOSTWIRE_API_KEY;
+  _resetAuth(); // restore no-auth baseline for the rest of the suite
 });
 
 function makePcap(name: string, sizeBytes: number): string {
@@ -195,4 +197,44 @@ test('AuditLog rotates to .1 when the size threshold is exceeded', async () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// --- Auth boundary (v0.2.1) -----------------------------------------------
+// The dashboard shell at / is public; only /api/* and /ws are gated.
+function withKey(key: string, fn: () => Promise<void>): Promise<void> {
+  process.env.GHOSTWIRE_API_KEY = key;
+  _resetAuth();
+  return fn().finally(() => {
+    delete process.env.GHOSTWIRE_API_KEY;
+    _resetAuth();
+  });
+}
+
+test('GET / returns 200 without auth when the API key is set (dashboard loads)', async () => {
+  // No dashboard build dir in CI => @fastify/static is not registered => /
+  // would 404. We assert the auth hook does NOT 401 it (the v0.2.0 bug).
+  await withKey('sekret', async () => {
+    const res = await app.inject({ method: 'GET', url: '/' });
+    assert.notEqual(res.statusCode, 401, 'dashboard shell must not be auth-gated');
+  });
+});
+
+test('GET /api/jobs => 401 without auth and 200 with (API stays gated)', async () => {
+  await withKey('sekret', async () => {
+    const noAuth = await app.inject({ method: 'GET', url: '/api/jobs' });
+    assert.equal(noAuth.statusCode, 401);
+    assert.match(noAuth.json().error, /Bearer/i);
+
+    const authed = await app.inject({
+      method: 'GET', url: '/api/jobs',
+      headers: { authorization: 'Bearer sekret' },
+    });
+    assert.equal(authed.statusCode, 200);
+  });
+});
+
+test('GET /api/jobs => 200 without auth when no API key is set (loopback/dev)', async () => {
+  // No key set => the API is open (loopback default). Confirm baseline unchanged.
+  const res = await app.inject({ method: 'GET', url: '/api/jobs' });
+  assert.equal(res.statusCode, 200);
 });

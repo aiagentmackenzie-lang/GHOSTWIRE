@@ -10,7 +10,7 @@
 services:
   ghostwire:
     build: .
-    image: ghcr.io/aiagentmackenzie-lang/ghostwire:0.2.0
+    image: ghcr.io/aiagentmackenzie-lang/ghostwire:0.2.1
     ports:
       - "3001:3001"
     environment:

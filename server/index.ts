@@ -94,12 +94,26 @@ function broadcast(message: object): void {
 }
 
 // Health check endpoint
-app.get('/health', async () => ({ status: 'ok', version: '0.2.0' }));
+app.get('/health', async () => ({ status: 'ok', version: '0.2.1' }));
 
 // --- Auth middleware --------------------------------------------------------
-const API_KEY = process.env.GHOSTWIRE_API_KEY || null;
-const API_KEY_ID = API_KEY ? createHash('sha256').update(API_KEY).digest('hex').slice(0, 16) : null;
+// API key read once at startup (the fail-closed guard below relies on it).
+// _resetAuth() re-reads from env for tests (mirrors _resetState for DATA_DIR).
+let API_KEY = process.env.GHOSTWIRE_API_KEY || null;
+let API_KEY_ID = API_KEY ? createHash('sha256').update(API_KEY).digest('hex').slice(0, 16) : null;
 
+export function _resetAuth() {
+  API_KEY = process.env.GHOSTWIRE_API_KEY || null;
+  API_KEY_ID = API_KEY ? createHash('sha256').update(API_KEY).digest('hex').slice(0, 16) : null;
+}
+
+// --- Auth middleware (v0.2.1 boundary inversion) ---------------------------
+// Gate ONLY /api/* and /ws. The dashboard shell at / and all static assets
+// are served WITHOUT auth — a browser cannot send Authorization: Bearer on
+// plain navigation, so gating / made the dashboard unreachable in v0.2.0.
+// The operator enters the API key in the dashboard UI (stored in browser
+// localStorage); the API is the real trust boundary. Unknown non-/api paths
+// fall through to @fastify/static → 404, not 401.
 app.addHook('onRequest', async (request: any, reply: any) => {
   if (request.url === '/health') return;
 
@@ -114,6 +128,10 @@ app.addHook('onRequest', async (request: any, reply: any) => {
     }
     return;
   }
+
+  // Only the API is gated. Static assets and unknown paths pass through to
+  // @fastify/static (which 404s unknown paths), so the dashboard loads.
+  if (!request.url.startsWith('/api/')) return;
 
   if (API_KEY) {
     const auth = request.headers['authorization'];

@@ -25,7 +25,7 @@ GHOSTWIRE is a developer-built network forensics engine that combines C2 beacon 
 - **Rich CLI Output** — Dark-themed terminal dashboard with tables and highlights
 - **React Dashboard + API** — Optional Fastify API server and Vite/React dashboard for browser-based hunting
 
-## Production readiness (v0.2.0)
+## Production readiness (v0.2.1)
 
 GHOSTWIRE ships the operational baseline a real tool needs, not just a demo:
 
@@ -85,6 +85,14 @@ The image binds `0.0.0.0` and refuses to start without `GHOSTWIRE_API_KEY`
 (fail-closed). Captures are read from `/data/samples` (mount `./samples:ro`);
 the SQLite job store + audit log persist in a named volume.
 
+**Auth boundary (v0.2.1):** the dashboard shell at `/` and all static assets are
+served **without** auth; only `/api/*` and `/ws` require the key. Open
+`http://localhost:3001` in a browser and enter `GHOSTWIRE_API_KEY` in the
+prompt — the key is stored in the browser (`localStorage`) and sent as
+`Authorization: Bearer` on API calls. It is never baked into the JS bundle
+(baking the build-time `VITE_API_TOKEN` would ship the secret to anyone who
+loads `/`, defeating API auth — fixed in v0.2.1).
+
 ### Dashboard + API server (optional)
 
 ```bash
@@ -104,7 +112,7 @@ a key (fail-closed).
 | Env var | Default | Purpose |
 |--------|---------|---------|
 | `GHOSTWIRE_HOST` | `127.0.0.1` | Bind address. Non-loopback requires `GHOSTWIRE_API_KEY`. |
-| `GHOSTWIRE_API_KEY` | unset | If set, requires `Authorization: Bearer <key>` (and `?token=` for WebSocket). Unset = open, loopback-only. |
+| `GHOSTWIRE_API_KEY` | unset | If set, the **API** (`/api/*`) and WebSocket require `Authorization: Bearer <key>` (or `?token=` for `/ws`). The dashboard HTML shell and static assets are served **without** auth — browsers cannot send a Bearer header on plain navigation, so the operator enters the key in the dashboard UI (stored in browser `localStorage`, never baked into the JS bundle). Unset = open, loopback-only. |
 | `GHOSTWIRE_ALLOWED_DIRS` | `<project>/samples` | Colon-separated PCAP directory allowlist. |
 | `GHOSTWIRE_MAX_PCAP_BYTES` | `524288000` | Max PCAP size; oversize -> 413 (no subprocess spawned). |
 | `GHOSTWIRE_ANALYSIS_TIMEOUT_MS` | `240000` | Subprocess timeout -> SIGTERM -> SIGKILL -> 504. |
@@ -203,6 +211,7 @@ The test suite synthesizes its own PCAPs (beacon, TLS-with-SNI, DNS-tunnel, CS-U
 - [x] C2 IOC feed loader + `refresh-feeds` CLI — v0.2.0
 - [x] DNS compression-pointer handling + strict DNS validation (reject non-DNS UDP, fail-closed on garbage qtypes/labels) — v0.2.0
 - [x] NetBIOS Name Service (NBNS/UDP 137) suppression — fixed 32-char A-P encoded names no longer flag as DNS tunneling — v0.2.0
+- [x] Dashboard auth boundary inversion + operator-entered API key (no secret baked into the JS bundle; `/api/*` and `/ws` gated, dashboard shell public) — v0.2.1
 - [ ] JA4X (X.509 certificate fingerprinting)
 - [ ] Runtime C2 feed fetch (currently bundled / local-dir only)
 - [ ] Multi-worker rate limiting (Redis; per-process today)
