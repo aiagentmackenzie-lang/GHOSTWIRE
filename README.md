@@ -201,8 +201,9 @@ The test suite synthesizes its own PCAPs (beacon, TLS-with-SNI, DNS-tunnel, CS-U
 - [x] SQLite job store + rotating audit log + async API — v0.2.0
 - [x] CI (ruff/mypy/pytest matrix + server + dashboard), Dockerfile, GHCR — v0.2.0
 - [x] C2 IOC feed loader + `refresh-feeds` CLI — v0.2.0
+- [x] DNS compression-pointer handling + strict DNS validation (reject non-DNS UDP, fail-closed on garbage qtypes/labels) — v0.2.0
+- [x] NetBIOS Name Service (NBNS/UDP 137) suppression — fixed 32-char A-P encoded names no longer flag as DNS tunneling — v0.2.0
 - [ ] JA4X (X.509 certificate fingerprinting)
-- [ ] DNS compression-pointer handling in the response decoder
 - [ ] Runtime C2 feed fetch (currently bundled / local-dir only)
 - [ ] Multi-worker rate limiting (Redis; per-process today)
 

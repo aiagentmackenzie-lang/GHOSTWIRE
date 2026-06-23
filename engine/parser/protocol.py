@@ -189,15 +189,140 @@ def decode_tls(payload: bytes) -> TLSInfo | None:
     return info
 
 
+# Maximum number of compression-pointer jumps we will follow when parsing a
+# DNS name. RFC 1035 names can chain pointers; a depth cap prevents infinite
+# loops on malformed/adversarial packets (and on non-DNS UDP we mistake for
+# DNS). 5 is well above any legitimate name depth.
+_DNS_MAX_PTR_DEPTH = 5
+
+# DNS qtypes are 16-bit, but IANA-assigned values are all <= 259 (RESINFO).
+# Values in the thousands (e.g. 17219, 49896 seen on the 4SICS capture) come
+# from misparsing non-DNS UDP and are implausible. We fail closed above 300.
+_DNS_MAX_PLAUSIBLE_QTYPE = 300
+
+# A DNS question section with more than a handful of entries is not real DNS
+# traffic; non-DNS UDP interpreted as a header routinely yields huge qdcount.
+_DNS_MAX_QDCOUNT = 10
+
+
+def _parse_dns_name_labels(payload: bytes, offset: int, depth: int = 0) -> tuple[list[str] | None, int]:
+    """Parse a RFC 1035 DNS name at ``offset`` with compression-pointer support.
+
+    Returns ``(labels, next_offset)`` where ``labels`` is the list of label
+    strings (None if the bytes are not a valid DNS name) and ``next_offset`` is
+    the position to continue parsing *after this name field* (following the
+    first occurrence of the name in the buffer, not the pointer target).
+
+    Validation (any failure => not DNS):
+    - label length byte 0x00 terminates the name
+    - 0xC0-0xFF (top two bits = 11) is a compression pointer: follow it once
+    - 0x40-0xBF (top two bits = 01 or 10) is reserved/invalid => reject
+    - 0x01-0x3F is a normal label; its bytes must be printable ASCII
+      (0x20-0x7E). Real DNS labels are ASCII (LDH / punycode "xn--"); control
+      or high bytes mean this is not a hostname.
+    - pointer targets must point into the buffer at offset >= 12 (the header
+      area); depth is capped to break pointer loops.
+    """
+    if depth > _DNS_MAX_PTR_DEPTH:
+        return None, offset
+
+    labels: list[str] = []
+    # The offset at which to continue parsing after this name. For an
+    # uncompressed name this is the position after the 0x00 terminator; for a
+    # name that ends with a compression pointer it is the position after the
+    # 2-byte pointer.
+    continue_offset: int | None = None
+    cur = offset
+
+    while cur < len(payload):
+        length = payload[cur]
+        if length == 0:
+            # root terminator
+            cur += 1
+            if continue_offset is None:
+                continue_offset = cur
+            break
+
+        top_two = length & 0xC0
+        if top_two == 0xC0:
+            # Compression pointer (2 bytes).
+            if cur + 1 >= len(payload):
+                return None, offset
+            ptr = ((length & 0x3F) << 8) | payload[cur + 1]
+            # The first time we hit a pointer, record the resume position.
+            if continue_offset is None:
+                continue_offset = cur + 2
+            # Pointers must land inside the buffer and not before the header
+            # (a sane pointer references an earlier name, offset >= 12).
+            if ptr < 12 or ptr >= len(payload):
+                return None, offset
+            sub_labels, _ = _parse_dns_name_labels(payload, ptr, depth + 1)
+            if sub_labels is None:
+                return None, offset
+            labels.extend(sub_labels)
+            break
+        elif top_two != 0x00:
+            # 0x40-0xBF: reserved label types — not valid DNS.
+            return None, offset
+
+        # Normal label, length 1-63.
+        cur += 1
+        if cur + length > len(payload):
+            return None, offset
+        label_bytes = payload[cur:cur + length]
+        # Reject control chars and non-ASCII. DNS labels are ASCII; binary
+        # bytes here mean we are parsing non-DNS UDP.
+        if any(b < 0x20 or b > 0x7E for b in label_bytes):
+            return None, offset
+        labels.append(label_bytes.decode("ascii", errors="replace"))
+        cur += length
+    else:
+        # Ran off the end without a 0x00 terminator or pointer — not valid.
+        return None, offset
+
+    return labels, continue_offset if continue_offset is not None else cur
+
+
+def _parse_dns_name(payload: bytes, offset: int) -> tuple[str | None, int]:
+    """Parse a DNS name and return ``(name_or_None, next_offset)``.
+
+    Thin wrapper over :func:`_parse_dns_name_labels` that joins labels with
+    '.'. A name with no labels (root) returns the empty string, which is a
+    valid DNS root name — callers that want to reject root names for a
+    question section do so at the call site.
+    """
+    labels, next_off = _parse_dns_name_labels(payload, offset)
+    if labels is None:
+        return None, offset
+    return ".".join(labels), next_off
+
+
 def decode_dns(payload: bytes) -> DNSInfo | None:
-    """Decode DNS message from raw payload."""
+    """Decode a DNS message from raw UDP payload.
+
+    Fails closed: returns ``None`` when the bytes do not structurally look like
+    DNS. This is critical because ``identify_protocol`` uses this to decide the
+    L7 protocol of every UDP packet — without strict validation, non-DNS UDP
+    (BACnet, SNMP, NetBIOS, ICS protocols) gets mislabeled as DNS, corrupting
+    protocol-breakdown stats and emitting garbage query names/types in reports.
+
+    Validation gates (any failure => None):
+    - qdcount in 0..10 (real DNS rarely has >1 question)
+    - the question name parses with compression-pointer support and ASCII-only
+      labels
+    - qtype is a plausible IANA value (<= 300)
+    """
     if len(payload) < 12:
         return None
 
-    # DNS header flags
     flags = struct.unpack("!H", payload[2:4])[0]
     qr = (flags >> 15) & 1
     rcode = flags & 0xF
+    qdcount = struct.unpack("!H", payload[4:6])[0]
+
+    # Non-DNS UDP interpreted as a header routinely yields absurd qdcount.
+    if qdcount > _DNS_MAX_QDCOUNT:
+        return None
 
     info = DNSInfo()
     info.is_query = qr == 0
@@ -206,23 +331,22 @@ def decode_dns(payload: bytes) -> DNSInfo | None:
     rcode_map = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
     info.response_code = rcode_map.get(rcode, str(rcode))
 
-    # Extract query name
-    qdcount = struct.unpack("!H", payload[4:6])[0]
-    if qdcount > 0 and len(payload) > 12:
-        offset = 12
-        labels = []
-        while offset < len(payload) and payload[offset] != 0:
-            label_len = payload[offset]
-            offset += 1
-            if offset + label_len > len(payload):
-                break
-            labels.append(payload[offset:offset+label_len].decode("utf-8", errors="replace"))
-            offset += label_len
-        info.query_name = ".".join(labels)
-        if offset < len(payload) - 2:
-            qtype = struct.unpack("!H", payload[offset+1:offset+3])[0]
-            type_map = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 255: "ANY"}
-            info.query_type = type_map.get(qtype, str(qtype))
+    type_map = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT",
+                28: "AAAA", 33: "SRV", 35: "NAPTR", 41: "OPT", 43: "DS", 46: "RRSIG",
+                47: "NSEC", 48: "DNSKEY", 255: "ANY", 257: "CAA"}
+
+    if qdcount > 0:
+        name, next_off = _parse_dns_name(payload, 12)
+        if name is None:
+            return None
+        info.query_name = name
+        # QTYPE (2) + QCLASS (2) follow the name.
+        if next_off + 4 > len(payload):
+            return None
+        qtype = struct.unpack("!H", payload[next_off:next_off + 2])[0]
+        if qtype > _DNS_MAX_PLAUSIBLE_QTYPE:
+            return None
+        info.query_type = type_map.get(qtype, str(qtype))
 
     return info
 

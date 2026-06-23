@@ -89,6 +89,10 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10,
     accumulator = SessionAccumulator(max_payload_bytes=_max_payload, max_sessions=_max_sessions)
     packets: list = []
     packets_total = 0
+    # Tally L7/L4 protocol counts during the stream so the text report can
+    # show an accurate protocol breakdown WITHOUT retaining every packet
+    # (the production analyze path uses keep_packets=False for bounded memory).
+    protocol_counts: dict[str, int] = {}
     http_fps: list = []
     ssh_fps: list = []
     # DNS query metadata collected during the stream so we do not re-iterate a
@@ -99,6 +103,8 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10,
 
     for pkt in iter_packet_records(pcap_file, parser=parser):
         packets_total += 1
+        _proto = pkt.protocol_l7 or pkt.protocol_l4 or "Other"
+        protocol_counts[_proto] = protocol_counts.get(_proto, 0) + 1
         if pkt.raw_payload:
             result = identify_protocol(
                 pkt.src_port, pkt.dst_port, pkt.raw_payload,
@@ -190,6 +196,7 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10,
     return {
         "packets": packets,
         "packets_total": packets_total,
+        "protocol_counts": protocol_counts,
         "sessions": sessions,
         "tls_fps": tls_fps,
         "http_fps": http_fps,
@@ -403,7 +410,7 @@ def _print_rich_summary(pcap_file, results, threat_scores, elapsed):
     overview.add_column("Key", style="cyan")
     overview.add_column("Value", style="white")
     overview.add_row("File", str(pcap_file))
-    overview.add_row("Packets", str(len(results["packets"])))
+    overview.add_row("Packets", str(results["packets_total"]))
     overview.add_row("Sessions", str(len(results["sessions"])))
     overview.add_row("TLS Fingerprints", str(len(results["tls_fps"])))
     overview.add_row("HTTP Fingerprints", str(len(results["http_fps"])))
@@ -414,13 +421,17 @@ def _print_rich_summary(pcap_file, results, threat_scores, elapsed):
     overview.add_row("Analysis Time", f"{elapsed:.2f}s")
     console.print(overview)
 
-    # Protocol breakdown
-    proto_counts: dict[str, int] = {}
-    for pkt in results["packets"]:
-        p = pkt.protocol_l7 or pkt.protocol_l4 or "Other"
-        proto_counts[p] = proto_counts.get(p, 0) + 1
+    # Protocol breakdown — use the counts tallied during the streaming pass
+    # (results["protocol_counts"]) so the report is accurate even when packets
+    # were not retained (production analyze path, keep_packets=False). Falls
+    # back to re-counting from the retained packet list for the report command.
+    proto_counts: dict[str, int] = results.get("protocol_counts") or {}
+    if not proto_counts:
+        for pkt in results["packets"]:
+            p = pkt.protocol_l7 or pkt.protocol_l4 or "Other"
+            proto_counts[p] = proto_counts.get(p, 0) + 1
 
-    total_packets = len(results["packets"])
+    total_packets = results["packets_total"] if results["packets_total"] else len(results["packets"])
     proto_table = Table(title="Protocol Breakdown", border_style="dim")
     proto_table.add_column("Protocol", style="cyan")
     proto_table.add_column("Packets", justify="right", style="white")

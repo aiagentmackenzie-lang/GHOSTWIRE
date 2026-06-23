@@ -49,6 +49,26 @@ def _is_plausible_dns(domain: str, query_type: str) -> bool:
     return query_type.upper() in _VALID_QTYPE_NAMES
 
 
+def _is_netbios_name(domain: str) -> bool:
+    """True if ``domain`` is a NetBIOS-encoded name (NBNS/NBNS broadcast).
+
+    NetBIOS Name Service (UDP/137) uses the DNS wire format but encodes each
+    byte of a 16-byte NetBIOS name as two characters in ``A``-``P``
+    (char = 'A' + nibble), yielding a single 32-character label like
+    ``CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`` or ``EJFDEBFEEBFACACACACACACACACACAAA``.
+
+    On a real ICS capture (4SICS) these Windows broadcasts were the ONLY
+    surviving "DNS threats" after parser hardening — and they are not DNS at
+    all. The 32-char length is not data exfil; it is the fixed NetBIOS name
+    encoding. Flagging them as tunneling is a false positive a production tool
+    must not emit. (Real-traffic fix 2026-06-23.)
+    """
+    # NetBIOS names are a single 32-char label (no dots) drawn from A-P.
+    if "." in domain or len(domain) != 32:
+        return False
+    return all("A" <= c <= "P" for c in domain)
+
+
 @dataclass
 class DNSThreat:
     """DNS threat detection result."""
@@ -245,8 +265,13 @@ def analyze_dns(domain: str, query_type: str = "A", response_code: str = "NOERRO
     Fails closed on parser garbage: a domain with control/non-ASCII bytes or an
     implausible qtype (e.g. 17219 from a misparsed UDP packet) produces no
     threats rather than a fake "tunneling" finding.
+
+    Also skips NetBIOS-encoded names (NBNS on UDP/137, which reuses the DNS wire
+    format): their fixed 32-char ``A``-``P`` encoding is not data exfil.
     """
     if not _is_plausible_dns(domain, query_type):
+        return []
+    if _is_netbios_name(domain):
         return []
 
     threats: list[DNSThreat] = []

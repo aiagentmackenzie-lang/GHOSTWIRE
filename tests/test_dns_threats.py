@@ -92,6 +92,20 @@ class TestDetectDNSTunneling:
         tunnel_threats = [t for t in threats if t.threat_type == "tunneling"]
         assert len(tunnel_threats) > 0, "NULL query type should flag tunneling"
 
+    def test_netbios_name_not_flagged(self):
+        """NetBIOS-encoded names (NBNS on UDP/137, DNS wire format) must not be
+        flagged as DNS tunneling. The 32-char A-P encoding is the fixed
+        NetBIOS name format, not data exfil. Regression for the two surviving
+        FPs on the 4SICS ICS capture (2026-06-23)."""
+        # CK + 30 'A's and EJFDEBFEEBFACACACACACACACACACAAA are real NBNS names
+        # seen on the capture, both on port 137.
+        nb1 = "CK" + "A" * 30
+        nb2 = "EJFDEBFEEBFACACACACACACACACACAAA"
+        assert analyze_dns(nb1, "SRV") == []
+        assert analyze_dns(nb2, "32") == []
+        # Sanity: a genuinely long subdomain (dotted, not A-P) still flags.
+        assert analyze_dns("a" * 40 + ".exfil.com", "A") != []
+
 
 class TestAnalyzeDNS:
     """Integration tests for the combined analyze_dns function."""

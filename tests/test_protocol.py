@@ -1,6 +1,10 @@
 """Tests for protocol identification (engine/parser/protocol.py)."""
 
+import struct
+
 from engine.parser.protocol import (
+    _parse_dns_name,
+    decode_dns,
     decode_http,
     identify_protocol,
 )
@@ -116,3 +120,120 @@ class TestDecodeHTTP:
         result = decode_http(payload)
         assert result is not None
         assert result.user_agent == "Mozilla/5.0"
+
+
+def _dns_query(name_labels, qtype=1, qclass=1, qdcount=1, flags=0x0100):
+    """Build a minimal DNS query payload from a list of (label) strings."""
+    buf = bytearray()
+    buf.extend(b"\x12\x34")          # transaction id
+    buf.extend(struct.pack("!H", flags))
+    buf.extend(struct.pack("!H", qdcount))
+    buf.extend(b"\x00\x00\x00\x00\x00\x00")  # an/ns/ar counts
+    for _ in range(qdcount):
+        for label in name_labels:
+            encoded = label.encode("ascii")
+            buf.append(len(encoded))
+            buf.extend(encoded)
+        buf.append(0x00)              # root terminator
+        buf.extend(struct.pack("!H", qtype))
+        buf.extend(struct.pack("!H", qclass))
+    return bytes(buf)
+
+
+class TestDecodeDNSValidation:
+    """Regression tests for the DNS parser hardening (2026-06-23).
+
+    Root bug: ``decode_dns`` used to accept ANY UDP payload >= 12 bytes as DNS,
+    did not handle compression pointers (read 0xC0 as a 192-byte label), and did
+    not validate label lengths or qtypes. On the real 4SICS ICS capture this
+    mislabeled BACnet/SNMP/NetBIOS UDP as DNS and emitted garbage qtypes
+    (17219, 49896) and binary domain names. These tests pin the fix.
+    """
+
+    def test_valid_query_parses(self):
+        """A well-formed DNS A query must still parse."""
+        payload = _dns_query(["example", "com"], qtype=1)
+        r = decode_dns(payload)
+        assert r is not None
+        assert r.query_name == "example.com"
+        assert r.query_type == "A"
+        assert r.is_query is True
+
+    def test_non_dns_udp_rejected(self):
+        """Random UDP bytes (not DNS) must return None, not a garbage DNSInfo."""
+        # Header bytes that yield qdcount=1 but a non-ASCII label.
+        payload = b"\x00\x00\x01\x00\x00\x01" + b"\x00" * 6 + b"\x04\xff\xfe\xfd\xfc\x00\x00\x01\x00\x01"
+        assert decode_dns(payload) is None
+
+    def test_random_high_port_udp_not_labeled_dns(self):
+        """Non-DNS UDP on a non-DNS port must not be classified as DNS."""
+        payload = bytes(range(40))  # deterministic non-DNS bytes
+        result = identify_protocol(47808, 47808, payload, l4_protocol="UDP")
+        assert result.l7_protocol == ""
+
+    def test_compression_pointer_followed(self):
+        """A DNS name ending in a compression pointer must resolve the full name.
+
+        Builds a buffer with 'example.com' at offset 12, then a name 'foo' +
+        pointer to offset 12. Must yield 'foo.example.com', not the
+        char-by-char garbage the pre-fix parser produced (it extend()ed the
+        joined string, iterating characters).
+        """
+        buf = bytearray(b"\x00" * 12)
+        buf.append(0x07)
+        buf.extend(b"example")
+        buf.append(0x03)
+        buf.extend(b"com")
+        buf.append(0x00)
+        buf.append(0x03)
+        buf.extend(b"foo")
+        buf.append(0xC0)
+        buf.append(0x0c)
+        name, nxt = _parse_dns_name(bytes(buf), 25)
+        assert name == "foo.example.com"
+        assert nxt == 31
+
+    def test_compression_pointer_loop_rejected(self):
+        """A pointer that points to itself (infinite loop) must be rejected."""
+        buf = bytearray(b"\x00" * 25)
+        buf.append(0xC0)
+        buf.append(0x19)  # 0x19 = 25 = self
+        name, _ = _parse_dns_name(bytes(buf), 25)
+        assert name is None
+
+    def test_reserved_label_type_rejected(self):
+        """A label length byte with top two bits = 01 or 10 (0x40-0xBF) is
+        reserved by RFC 1035 and must be rejected as not-DNS."""
+        # 0x40 as the first label length.
+        payload = b"\x00\x00\x01\x00\x00\x01" + b"\x00" * 6 + b"\x40\x00\x00\x01\x00\x01"
+        assert decode_dns(payload) is None
+
+    def test_implausible_qtype_rejected(self):
+        """A qtype in the thousands (17219, as seen on the 4SICS capture) is
+        not a real DNS query type and must be rejected."""
+        buf = bytearray(b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        buf.append(0x07)
+        buf.extend(b"example")
+        buf.append(0x03)
+        buf.extend(b"com")
+        buf.append(0x00)
+        buf.extend(struct.pack("!H", 17219))   # garbage qtype
+        buf.extend(struct.pack("!H", 1))
+        assert decode_dns(bytes(buf)) is None
+
+    def test_huge_qdcount_rejected(self):
+        """A qdcount in the thousands is not real DNS; reject it early."""
+        payload = b"\x00\x00\x01\x00" + struct.pack("!H", 5000) + b"\x00" * 6
+        assert decode_dns(payload) is None
+
+    def test_truncated_name_rejected(self):
+        """A label that runs past the buffer end is not valid DNS."""
+        payload = b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + b"\x20short"
+        # label length 0x20=32 but only 5 bytes follow
+        assert decode_dns(payload) is None
+
+    def test_binary_label_bytes_rejected(self):
+        """Label bytes with control/high bytes (not ASCII) mean this is not a
+        hostname — reject so binary 'domain names' never reach reports."""
+        payload = b"\x00\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + b"\x04\xff\xfe\xfd\xfc\x00\x00\x01\x00\x01"
+        assert decode_dns(payload) is None
