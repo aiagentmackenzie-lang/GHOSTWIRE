@@ -476,6 +476,37 @@ def _print_rich_summary(pcap_file, results, threat_scores, elapsed):
 
     console.print()
 
+@cli.command("refresh-feeds")
+@click.option("--feeds-dir", "feeds_dir", type=click.Path(exists=True, file_okay=False),
+              default=str(Path(__file__).resolve().parent / "feeds"),
+              show_default=True,
+              help="Directory of *.json feed files to validate and summarize.")
+def refresh_feeds(feeds_dir: str):
+    """Validate and summarize C2 IOC feeds without running an analysis (Phase 4.2)."""
+    from engine.feeds.loader import load_feeds_from_dir
+    entries = load_feeds_from_dir(feeds_dir)
+    if not entries:
+        console.print(f"[yellow]No feed entries loaded from {feeds_dir}[/]")
+        return
+    by_tool: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    for e in entries:
+        by_tool[e.tool] = by_tool.get(e.tool, 0) + 1
+        by_type[e.match_type] = by_type.get(e.match_type, 0) + 1
+    console.print(f"[green]Loaded {len(entries)} feed entries from {feeds_dir}[/]")
+    table = Table(title="Feeds by tool")
+    table.add_column("Tool")
+    table.add_column("Entries", justify="right")
+    for tool, n in sorted(by_tool.items()):
+        table.add_row(tool, str(n))
+    console.print(table)
+    table2 = Table(title="Feeds by match_type")
+    table2.add_column("Match type")
+    table2.add_column("Entries", justify="right")
+    for mt, n in sorted(by_type.items()):
+        table2.add_row(mt, str(n))
+    console.print(table2)
+
 
 def main():
     cli()

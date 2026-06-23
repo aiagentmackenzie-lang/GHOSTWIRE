@@ -158,7 +158,37 @@ KNOWN_C2_PATTERNS: dict[str, dict] = {
 }
 
 
+_feeds_loaded = False
+
+
+def _ensure_feeds_loaded() -> None:
+    """Lazily ingest C2 IOC feed files on first use (Phase 4.2).
+
+    Reads every *.json in GHOSTWIRE_FEEDS_DIR (default: the bundled
+    engine/feeds directory) and merges the entries into KNOWN_C2_PATTERNS.
+    Invalid feeds are skipped with a warning; the match path never raises.
+    """
+    global _feeds_loaded
+    if _feeds_loaded:
+        return
+    _feeds_loaded = True
+    import os
+    from pathlib import Path
+
+    from engine.feeds.loader import apply_feeds, load_feeds_from_dir
+    default_dir = Path(__file__).resolve().parent.parent / "feeds"
+    feeds_dir = os.environ.get("GHOSTWIRE_FEEDS_DIR", str(default_dir))
+    try:
+        entries = load_feeds_from_dir(feeds_dir)
+        if entries:
+            n = apply_feeds(entries, KNOWN_C2_PATTERNS)
+            logger.info(f"Loaded {n} feed entries from {feeds_dir}")
+    except Exception as e:  # never break detection on a bad feed
+        logger.warning(f"Feed loading failed ({feeds_dir}): {e}")
+
+
 def match_ja4(ja4: str) -> list[C2Match]:
+    _ensure_feeds_loaded()
     """Match a JA4 fingerprint against known C2 prefix patterns.
 
     JA4 prefixes are coarse — a prefix match is a hint, not a unique

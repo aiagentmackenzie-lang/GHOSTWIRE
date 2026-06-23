@@ -1,0 +1,34 @@
+[
+  {
+    "tool": "cobalt_strike",
+    "match_type": "ja4",
+    "value": "t13d1516h2_",
+    "confidence": 0.70,
+    "source": "FoxIO JA4 research / community datasets",
+    "license": "FoxIO JA4 datasets (publicly published research)"
+  },
+  {
+    "tool": "cobalt_strike",
+    "match_type": "ja4",
+    "value": "t12d0812h2_",
+    "confidence": 0.70,
+    "source": "FoxIO JA4 research / community datasets",
+    "license": "FoxIO JA4 datasets (publicly published research)"
+  },
+  {
+    "tool": "metasploit",
+    "match_type": "ja4",
+    "value": "t12d0503h2_",
+    "confidence": 0.70,
+    "source": "Metasploit Ruby OpenSSL JA4 research prefix",
+    "license": "community research (no restrictive dataset)"
+  },
+  {
+    "tool": "sliver",
+    "match_type": "ja4",
+    "value": "t12d0504h2_",
+    "confidence": 0.70,
+    "source": "Sliver / Go crypto/tls JA4 research prefix",
+    "license": "community research (no restrictive dataset)"
+  }
+]
