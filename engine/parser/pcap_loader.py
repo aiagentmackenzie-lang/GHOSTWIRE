@@ -1,10 +1,13 @@
-"""PCAP/PCAPNG file loader using scapy and dpkt."""
+"""PCAP/PCAPNG file loader using scapy and dpkt (streaming + list)."""
 
 from __future__ import annotations
 
 import logging
+import socket
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +24,8 @@ try:
     from scapy.all import IP as ScapyIP
     from scapy.all import TCP as ScapyTCP
     from scapy.all import UDP as ScapyUDP
-    from scapy.all import rdpcap
+    from scapy.all import IPv6 as ScapyIPv6
+    from scapy.all import PcapReader as ScapyPcapReader
 except ImportError:
     pass  # Will fail at runtime if neither available
 
@@ -61,18 +65,66 @@ def _ip_to_str(ip_bytes: bytes) -> str:
     return ".".join(str(b) for b in ip_bytes)
 
 
+def _ip6_to_str(ip_bytes: bytes) -> str:
+    """Convert 16-byte IPv6 address to compressed string."""
+    return socket.inet_ntop(socket.AF_INET6, bytes(ip_bytes))
+
+
 def _mac_to_str(mac_bytes: bytes) -> str:
     """Convert 6-byte MAC to colon-separated hex."""
     return ":".join(f"{b:02x}" for b in mac_bytes)
 
 
-def _parse_with_dpkt(filepath: Path) -> list[PacketRecord]:
-    """Parse PCAP using dpkt — fast path.
+def _fill_l4_dpkt(record: PacketRecord, l4: Any) -> None:
+    """Populate L4 fields on a PacketRecord from a dpkt L4 payload object.
+
+    Shared by the IPv4 and IPv6 dpkt paths so neither duplicates the
+    TCP/UDP/ICMP dispatch.
+    """
+    if isinstance(l4, dpkt.tcp.TCP):
+        tcp = l4
+        record.protocol_l4 = "TCP"
+        record.src_port = tcp.sport
+        record.dst_port = tcp.dport
+        record.raw_payload = bytes(tcp.data) if tcp.data else b""
+        record.metadata["tcp_flags"] = tcp.flags
+        record.metadata["tcp_seq"] = tcp.seq
+        record.metadata["tcp_ack"] = tcp.ack
+        record.metadata["tcp_win"] = tcp.win
+    elif isinstance(l4, dpkt.udp.UDP):
+        udp = l4
+        record.protocol_l4 = "UDP"
+        record.src_port = udp.sport
+        record.dst_port = udp.dport
+        record.raw_payload = bytes(udp.data) if udp.data else b""
+    elif isinstance(l4, dpkt.icmp.ICMP):
+        record.protocol_l4 = "ICMP"
+        icmp = l4
+        record.metadata["icmp_type"] = icmp.type
+        record.metadata["icmp_code"] = icmp.code
+        record.raw_payload = bytes(icmp.data) if icmp.data else b""
+    else:
+        # ICMP6 or other L4 over IPv6 - best-effort payload capture.
+        try:
+            if isinstance(l4, dpkt.icmp6.ICMP6):
+                record.protocol_l4 = "ICMP6"
+                record.metadata["icmp_type"] = getattr(l4, "type", 0)
+                record.metadata["icmp_code"] = getattr(l4, "code", 0)
+                record.raw_payload = bytes(l4.data) if l4.data else b""
+                return
+        except (ImportError, AttributeError):
+            pass
+        # Unknown L4 - keep whatever bytes we can.
+        record.protocol_l4 = type(l4).__name__
+        if hasattr(l4, "data") and l4.data:
+            record.raw_payload = bytes(l4.data)
+
+
+def _iter_dpkt(filepath: Path) -> Iterator[PacketRecord]:
+    """Yield PacketRecords from a PCAP using dpkt (streaming fast path).
 
     Raises ValueError if the file cannot be parsed as a valid PCAP/PCAPNG.
     """
-    packets: list[PacketRecord] = []
-
     with open(filepath, "rb") as f:
         try:
             pcap = dpkt.pcap.Reader(f)
@@ -91,108 +143,109 @@ def _parse_with_dpkt(filepath: Path) -> list[PacketRecord]:
                 eth = dpkt.ethernet.Ethernet(buf)
                 record = PacketRecord(index=idx, timestamp=ts, length=len(buf))
 
-                if not isinstance(eth.data, dpkt.ip.IP):
-                    record.protocol_l3 = type(eth.data).__name__
-                    packets.append(record)
+                # IPv4 (EtherType 0x0800)
+                if isinstance(eth.data, dpkt.ip.IP):
+                    ip = eth.data
+                    record.src_ip = _ip_to_str(ip.src)
+                    record.dst_ip = _ip_to_str(ip.dst)
+                    record.ttl = ip.ttl
+                    record.protocol_l3 = "IP"
+                    _fill_l4_dpkt(record, ip.data)
+                    yield record
                     continue
 
-                ip = eth.data
-                record.src_ip = _ip_to_str(ip.src)
-                record.dst_ip = _ip_to_str(ip.dst)
-                record.ttl = ip.ttl
-                record.protocol_l3 = "IP"
+                # IPv6 (EtherType 0x86DD)
+                if isinstance(eth.data, dpkt.ip6.IP6):
+                    ip6 = eth.data
+                    record.src_ip = _ip6_to_str(ip6.src)
+                    record.dst_ip = _ip6_to_str(ip6.dst)
+                    # dpkt stores hop limit as 'hlim' on IP6
+                    record.ttl = getattr(ip6, "hlim", 0)
+                    record.protocol_l3 = "IPv6"
+                    _fill_l4_dpkt(record, ip6.data)
+                    yield record
+                    continue
 
-                if isinstance(ip.data, dpkt.tcp.TCP):
-                    tcp = ip.data
-                    record.protocol_l4 = "TCP"
-                    record.src_port = tcp.sport
-                    record.dst_port = tcp.dport
-                    record.raw_payload = bytes(tcp.data) if tcp.data else b""
-                    record.metadata["tcp_flags"] = tcp.flags
-                    record.metadata["tcp_seq"] = tcp.seq
-                    record.metadata["tcp_ack"] = tcp.ack
-                    record.metadata["tcp_win"] = tcp.win
-
-                elif isinstance(ip.data, dpkt.udp.UDP):
-                    udp = ip.data
-                    record.protocol_l4 = "UDP"
-                    record.src_port = udp.sport
-                    record.dst_port = udp.dport
-                    record.raw_payload = bytes(udp.data) if udp.data else b""
-
-                elif isinstance(ip.data, dpkt.icmp.ICMP):
-                    record.protocol_l4 = "ICMP"
-                    icmp = ip.data
-                    record.metadata["icmp_type"] = icmp.type
-                    record.metadata["icmp_code"] = icmp.code
-                    record.raw_payload = bytes(icmp.data) if icmp.data else b""
-
-                packets.append(record)
+                # Non-IP L3 (ARP, etc.)
+                record.protocol_l3 = type(eth.data).__name__
+                yield record
 
             except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError) as e:
                 logger.debug(f"Packet {idx} parse error: {e}")
-                packets.append(PacketRecord(index=idx, timestamp=ts, length=len(buf)))
-
-    return packets
+                yield PacketRecord(index=idx, timestamp=ts, length=len(buf))
 
 
-def _parse_with_scapy(filepath: Path) -> list[PacketRecord]:
-    """Parse PCAP using scapy — fallback / verification path."""
-    packets: list[PacketRecord] = []
-    raw_pkts = rdpcap(str(filepath))
-
-    for idx, pkt in enumerate(raw_pkts):
-        record = PacketRecord(
-            index=idx,
-            timestamp=float(pkt.time),
-            length=len(pkt),
-        )
-
-        if pkt.haslayer(ScapyIP):
-            ip = pkt[ScapyIP]
-            record.src_ip = ip.src
-            record.dst_ip = ip.dst
-            record.ttl = ip.ttl
-            record.protocol_l3 = "IP"
-
-            if pkt.haslayer(ScapyTCP):
-                tcp = pkt[ScapyTCP]
-                record.protocol_l4 = "TCP"
-                record.src_port = tcp.sport
-                record.dst_port = tcp.dport
-                record.raw_payload = bytes(tcp.payload) if tcp.payload else b""
-                record.metadata["tcp_flags"] = int(tcp.flags)
-                record.metadata["tcp_seq"] = tcp.seq
-                record.metadata["tcp_ack"] = tcp.ack
-
-            elif pkt.haslayer(ScapyUDP):
-                udp = pkt[ScapyUDP]
-                record.protocol_l4 = "UDP"
-                record.src_port = udp.sport
-                record.dst_port = udp.dport
-                record.raw_payload = bytes(udp.payload) if udp.payload else b""
-
-            elif pkt.haslayer(ScapyICMP):
-                record.protocol_l4 = "ICMP"
-                icmp = pkt[ScapyICMP]
-                record.metadata["icmp_type"] = icmp.type
-                record.metadata["icmp_code"] = icmp.code
-                record.raw_payload = bytes(icmp.payload) if icmp.payload else b""
-
-        packets.append(record)
-
-    return packets
+def _fill_l4_scapy(record: PacketRecord, pkt: Any) -> None:
+    """Populate L4 fields from a scapy packet (shared IPv4/IPv6 path)."""
+    if pkt.haslayer(ScapyTCP):
+        tcp = pkt[ScapyTCP]
+        record.protocol_l4 = "TCP"
+        record.src_port = tcp.sport
+        record.dst_port = tcp.dport
+        record.raw_payload = bytes(tcp.payload) if tcp.payload else b""
+        record.metadata["tcp_flags"] = int(tcp.flags)
+        record.metadata["tcp_seq"] = tcp.seq
+        record.metadata["tcp_ack"] = tcp.ack
+    elif pkt.haslayer(ScapyUDP):
+        udp = pkt[ScapyUDP]
+        record.protocol_l4 = "UDP"
+        record.src_port = udp.sport
+        record.dst_port = udp.dport
+        record.raw_payload = bytes(udp.payload) if udp.payload else b""
+    elif pkt.haslayer(ScapyICMP):
+        record.protocol_l4 = "ICMP"
+        icmp = pkt[ScapyICMP]
+        record.metadata["icmp_type"] = icmp.type
+        record.metadata["icmp_code"] = icmp.code
+        record.raw_payload = bytes(icmp.payload) if icmp.payload else b""
 
 
-def load_pcap(filepath: str | Path, *, parser: str = "auto") -> list[PacketRecord]:
-    """Load a PCAP or PCAPNG file and return structured packet records.
+def _iter_scapy(filepath: Path) -> Iterator[PacketRecord]:
+    """Yield PacketRecords from a PCAP using scapy (streaming fallback path).
+
+    Uses PcapReader (read-packet-at-a-time) instead of rdpcap (loads the whole
+    file into memory) so a large capture does not OOM the process.
+    (production-plan Phase 2.3)
+    """
+    with ScapyPcapReader(str(filepath)) as reader:
+        for idx, pkt in enumerate(reader):
+            record = PacketRecord(
+                index=idx,
+                timestamp=float(pkt.time),
+                length=len(pkt),
+            )
+
+            if pkt.haslayer(ScapyIP):
+                ip = pkt[ScapyIP]
+                record.src_ip = ip.src
+                record.dst_ip = ip.dst
+                record.ttl = ip.ttl
+                record.protocol_l3 = "IP"
+                _fill_l4_scapy(record, pkt)
+            elif 'ScapyIPv6' in globals() and pkt.haslayer(ScapyIPv6):
+                ip6 = pkt[ScapyIPv6]
+                record.src_ip = ip6.src
+                record.dst_ip = ip6.dst
+                record.ttl = getattr(ip6, "hlim", 0)
+                record.protocol_l3 = "IPv6"
+                _fill_l4_scapy(record, pkt)
+
+            yield record
+
+
+def iter_packet_records(filepath: str | Path, *, parser: str = "auto") -> Iterator[PacketRecord]:
+    """Stream PacketRecords from a PCAP/PCAPNG file, one at a time.
+
+    Memory-bounded alternative to :func:`load_pcap`: the caller can process
+    packets incrementally (identify protocol, fingerprint, accumulate bounded
+    sessions) without ever holding the whole capture in memory. (Phase 2.3)
 
     Args:
         filepath: Path to the capture file.
         parser: "dpkt" (fast), "scapy" (full), or "auto" (dpkt if available).
 
-    Returns:
-        List of PacketRecord objects.
+    Yields:
+        PacketRecord objects.
 
     Raises:
         FileNotFoundError: If the file doesn't exist.
@@ -206,33 +259,30 @@ def load_pcap(filepath: str | Path, *, parser: str = "auto") -> list[PacketRecor
     if suffix not in (".pcap", ".pcapng", ".cap"):
         raise ValueError(f"Unsupported file format: {suffix}. Use .pcap or .pcapng")
 
-    logger.info(f"Loading {path} ({path.stat().st_size / 1_048_576:.1f} MB)")
+    logger.info(f"Streaming {path} ({path.stat().st_size / 1_048_576:.1f} MB)")
 
     if parser == "auto":
         parser = "dpkt" if _USE_DPKT else "scapy"
 
-    last_error = None
-
-    # Try requested parser; on failure, fall back to the other one
-    parsers_to_try = []
+    # Build the ordered list of parsers to try. On a ValueError (format
+    # mismatch) we fall through to the next parser; other exceptions propagate.
     if parser == "dpkt" and _USE_DPKT:
-        parsers_to_try = ["dpkt", "scapy"]
+        parsers: list[str] = ["dpkt", "scapy"]
     elif parser == "scapy":
-        parsers_to_try = ["scapy"]
+        parsers = ["scapy"]
     else:
-        # dpkt requested but not available — use scapy
-        parsers_to_try = ["scapy"]
+        parsers = ["scapy"]
 
-    for p in parsers_to_try:
+    last_error: str | None = None
+    for p in parsers:
         try:
             if p == "dpkt":
-                packets = _parse_with_dpkt(path)
+                yield from _iter_dpkt(path)
+                return
             else:
-                packets = _parse_with_scapy(path)
-            logger.info(f"Loaded {len(packets)} packets (parser={p})")
-            return packets
+                yield from _iter_scapy(path)
+                return
         except ValueError:
-            # dpkt couldn't parse — try scapy fallback
             last_error = f"File is not a valid capture: {path.name}"
             logger.debug(f"Parser {p} failed, trying next fallback")
             continue
@@ -241,5 +291,28 @@ def load_pcap(filepath: str | Path, *, parser: str = "auto") -> list[PacketRecor
             logger.debug(f"Parser {p} failed with {e}, trying next fallback")
             continue
 
-    # All parsers failed
     raise ValueError(last_error or f"Failed to parse capture file: {path.name}")
+
+
+def load_pcap(filepath: str | Path, *, parser: str = "auto") -> list[PacketRecord]:
+    """Load a PCAP or PCAPNG file and return structured packet records (list).
+
+    Eager counterpart to :func:`iter_packet_records`. Convenience for callers
+    that want the whole list (hunt command, unit tests). Use
+    ``iter_packet_records`` directly when memory bounding matters (analyze on
+    large captures - see Phase 2.3).
+
+    Args:
+        filepath: Path to the capture file.
+        parser: "dpkt" (fast), "scapy" (full), or "auto" (dpkt if available).
+
+    Returns:
+        List of PacketRecord objects.
+
+    Raises:
+        FileNotFoundError: If the file doesn't exist.
+        ValueError: If the file format is unsupported.
+    """
+    records = list(iter_packet_records(filepath, parser=parser))
+    logger.info(f"Loaded {len(records)} packets")
+    return records

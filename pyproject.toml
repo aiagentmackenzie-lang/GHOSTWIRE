@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ghostwire"
-version = "0.1.0"
+version = "0.2.0"
 description = "GHOSTWIRE — Network Forensics Engine. The wire remembers everything."
 readme = "README.md"
 license = {text = "MIT"}
@@ -22,12 +22,17 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 dependencies = [
     "scapy>=2.6",
     "dpkt>=1.9.8",
-    "ja4plus>=0.4",
+    # ja4plus: pin to a compatible range — a major bump could change the
+    # parse_tls_handshake dict shape (keys: type/sni/ciphers/extensions/
+    # supported_versions/version) that ja4_engine.py reads. Bump only after
+    # re-verifying those keys in tests/test_fingerprint.py.
+    "ja4plus>=0.5,<0.6",
     "rich>=13.0",
     "click>=8.0",
 ]
@@ -72,8 +77,10 @@ warn_redundant_casts = true
 no_implicit_optional = true
 check_untyped_defs = true
 files = ["engine"]
-# Third-party libs (scapy/dpkt/ja4plus) ship no stubs; don't fail the gate on them.
-ignore_missing_imports = true
+# Third-party libs (scapy/dpkt/ja4plus) ship no stubs; we ship minimal partial
+# stubs under typings/ (Phase 6.1) so the boundary is not blind. Drop the
+# blanket ignore_missing_imports; mypy finds the stubs via mypy_path below.
+mypy_path = ["typings"]
 
 [[tool.mypy.overrides]]
 # scapy.all populates IP/TCP/UDP/ICMP/Raw at runtime, so mypy reports

@@ -14,10 +14,16 @@ class TestDetectDGA:
         assert len(dga_threats) > 0, "High-entropy domain should flag DGA"
 
     def test_hex_domain_flags_dga(self):
-        """Hex-only domain labels should trigger DGA flag."""
-        threats = analyze_dns("a3f8b2c1d9e7f0.example.com", "A")
+        """A hex-only SLD (the registrable label) should trigger DGA. A hex
+        *subdomain* of a legit SLD (e.g. cb922b3f.fanoutcdn.com) must NOT -
+        real CDNs use hash subdomains."""
+        threats = analyze_dns("a3f8b2c1d9e7f0.com", "A")  # SLD is hex
         dga_threats = [t for t in threats if t.threat_type == "dga"]
-        assert len(dga_threats) > 0, "Hex domain label should flag DGA"
+        assert len(dga_threats) > 0, "Hex SLD should flag DGA"
+        # And a hex subdomain of a known CDN must NOT flag DGA.
+        threats2 = analyze_dns("cb922b3f.fanoutcdn.com", "A")
+        dga2 = [t for t in threats2 if t.threat_type == "dga"]
+        assert len(dga2) == 0, "Hex subdomain of a CDN must not flag DGA"
 
     def test_known_good_domain_no_flag(self):
         """Well-known legitimate domains should not flag DGA."""
@@ -35,10 +41,11 @@ class TestDetectDGA:
         """Audit M-06: a domain that merely CONTAINS a known-good substring
         (e.g. 'aws') but whose SLD is not known-good must still be analyzed.
         The old substring filter would skip this and hide a real DGA domain."""
-        # 'q8zaws7xk5mpl' contains the substring 'aws' but its SLD is 'evil'.
-        # Old code: any('aws' in domain) → skipped → None.
-        # New code: SLD 'evil' not known-good → analyzed → flags DGA.
-        result = detect_dga("q8zaws7xk5mpl.evil.com")
+        # 'awsxkqzlwyt' contains the substring 'aws' but is not the exact
+        # known-good SLD 'aws' (audit M-06: the old substring filter would have
+        # skipped it). Exact-SLD matching means it is analyzed, and the
+        # consonant cluster flags DGA.
+        result = detect_dga("awsxkqzlwyt.com")
         assert result is not None, "Substring 'aws' must not skip a non-known-good SLD"
         assert result.threat_type == "dga"
 
@@ -96,8 +103,8 @@ class TestAnalyzeDNS:
 
     def test_dga_and_tunneling_both_flagged(self):
         """A domain can be flagged for both DGA and tunneling."""
-        # Hex-like subdomain + TXT query
-        threats = analyze_dns("a3f8b2c1d9e7f0123456789abcdef.evil.com", "TXT")
+        # Hex SLD (DGA) + TXT query type (tunneling).
+        threats = analyze_dns("a3f8b2c1d9e7f0123456789.com", "TXT")
         types = {t.threat_type for t in threats}
         assert "dga" in types, "Should flag DGA"
         assert "tunneling" in types, "Should flag tunneling"

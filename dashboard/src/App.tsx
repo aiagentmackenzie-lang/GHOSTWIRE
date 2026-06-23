@@ -41,32 +41,62 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [filePath, setFilePath] = useState('')
 
+  // API base + optional bearer token (Phase 6.2). Defaults to same-origin so
+  // the dashboard served by the server (Phase 5) just works; in dev, set
+  // VITE_API_BASE=http://localhost:3001 in dashboard/.env.
+  const API_BASE = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '')
+  const authHeaders = (): Record<string, string> => {
+    const t = import.meta.env.VITE_API_TOKEN as string | undefined
+    return t ? { Authorization: `Bearer ${t}` } : {}
+  }
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
   const runAnalysis = useCallback(async (path: string) => {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch('http://localhost:3001/api/analyze', {
+      // Async job model (Phase 3): POST returns { jobId } immediately, then
+      // we poll /api/jobs/:id until completed/failed.
+      const res = await fetch(`${API_BASE}/api/analyze`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ filePath: path }),
       })
       const data = await res.json()
-      if (data.error) {
-        setError(data.error + (data.details ? ': ' + data.details : ''))
-      } else {
-        setAnalysis(data)
+      if (!res.ok || data.error) {
+        setError(data.error || `Analysis rejected (${res.status})`)
+        setLoading(false)
+        return
       }
+      const jobId: string = data.jobId
+      const deadline = Date.now() + 5 * 60 * 1000
+      while (Date.now() < deadline) {
+        await sleep(1000)
+        const jr = await fetch(`${API_BASE}/api/jobs/${jobId}`, { headers: authHeaders() })
+        const job = await jr.json()
+        if (job.status === 'completed') {
+          setAnalysis(job.summary)
+          setLoading(false)
+          return
+        }
+        if (job.status === 'failed') {
+          setError(job.error || 'Analysis failed')
+          setLoading(false)
+          return
+        }
+      }
+      setError('Analysis timed out (no result within 5 minutes)')
+      setLoading(false)
     } catch (e: any) {
       setError('Failed to connect to GHOSTWIRE API. Is the server running?')
-    } finally {
       setLoading(false)
     }
-  }, [])
+  }, [API_BASE])
 
   // Load demo data
   const loadDemo = useCallback(() => {
     setAnalysis({
-      ghostwire_version: '0.1.0',
+      ghostwire_version: '0.2.0',
       file: 'samples/c2_beacon_test.pcap',
       analysis_time: 0.02,
       packets_total: 110,
@@ -133,7 +163,7 @@ function App() {
             GHOSTWIRE
           </h1>
           <p style={{ fontSize: '12px', color: 'var(--text-dim)', fontFamily: 'var(--font-mono)' }}>
-            Network Forensics Engine v0.1.0
+            Network Forensics Engine v0.2.0
           </p>
         </div>
 

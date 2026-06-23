@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import math
 from collections.abc import Callable
@@ -183,26 +184,18 @@ def hunt_data_exfil(sessions: list[TCPSession]) -> list[dict]:
 
 
 def _is_private_ip(ip: str) -> bool:
-    """Check if an IP address is RFC 1918 private, link-local, or loopback."""
-    if ip.startswith("10."):
-        return True
-    if ip.startswith("172."):
-        # 172.16.0.0/12 — 172.16.x.x through 172.31.x.x
-        parts = ip.split(".")
-        if len(parts) == 4:
-            try:
-                second = int(parts[1])
-                if 16 <= second <= 31:
-                    return True
-            except ValueError:
-                pass
-    if ip.startswith("192.168."):
-        return True
-    if ip.startswith("127."):
-        return True  # loopback
-    if ip.startswith("169.254."):
-        return True  # link-local
-    return False
+    """Check if an IP is private/loopback/link-local (IPv4 + IPv6).
+
+    Uses stdlib ipaddress so IPv6 is covered (fc00::/7 ULA, fe80::/10
+    link-local, ::1 loopback) alongside RFC 1918 / 127.0.0.0/8 / 169.254/16.
+    """
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return bool(addr.is_private or addr.is_loopback or addr.is_link_local)
 
 
 suspicious_ports = {22, 23, 445, 3389, 5985, 5986, 513, 514, 25}
