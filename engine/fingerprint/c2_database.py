@@ -247,18 +247,30 @@ def match_ja3(ja3: str) -> list[C2Match]:
     return matches
 
 
+def _normalize_ua(ua: str) -> str:
+    """Normalize a User-Agent for exact matching (Phase 6.3).
+
+    Strips leading/trailing whitespace and collapses internal runs of
+    whitespace to a single space, so a one-space difference (e.g. a trailing
+    space or a doubled internal space from a malleable C2 profile tweak) does
+    not miss a real default UA. Semantics stay EXACT - no substring matching -
+    this only removes insignificant whitespace.
+    """
+    return " ".join(ua.split()).lower()
+
+
 def match_http(user_agent: str) -> list[C2Match]:
-    """Match HTTP User-Agent against known C2 patterns (exact match only)."""
+    """Match HTTP User-Agent against known C2 patterns (exact, whitespace-normalized)."""
     if not user_agent:
         return []
 
     matches: list[C2Match] = []
-    ua_lower = user_agent.lower().strip()
+    ua_norm = _normalize_ua(user_agent)
 
     for tool_name, data in KNOWN_C2_PATTERNS.items():
         for entry in data.get("http_patterns", {}).get("user_agents", []):
             known_ua, conf, _source = entry
-            if ua_lower == known_ua.lower():
+            if ua_norm == _normalize_ua(known_ua):
                 matches.append(C2Match(
                     tool_name=tool_name,
                     confidence=conf,

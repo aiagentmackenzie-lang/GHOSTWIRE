@@ -77,8 +77,10 @@ warn_redundant_casts = true
 no_implicit_optional = true
 check_untyped_defs = true
 files = ["engine"]
-# Third-party libs (scapy/dpkt/ja4plus) ship no stubs; don't fail the gate on them.
-ignore_missing_imports = true
+# Third-party libs (scapy/dpkt/ja4plus) ship no stubs; we ship minimal partial
+# stubs under typings/ (Phase 6.1) so the boundary is not blind. Drop the
+# blanket ignore_missing_imports; mypy finds the stubs via mypy_path below.
+mypy_path = ["typings"]
 
 [[tool.mypy.overrides]]
 # scapy.all populates IP/TCP/UDP/ICMP/Raw at runtime, so mypy reports

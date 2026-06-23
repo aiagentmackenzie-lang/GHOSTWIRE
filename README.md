@@ -4,15 +4,15 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat)
-![Status](https://img.shields.io/badge/Status-Alpha-orange?style=flat)
+![Status](https://img.shields.io/badge/Status-Beta-blue?style=flat)
 
 GHOSTWIRE is a developer-built network forensics engine that combines C2 beacon detection, JA4+ fingerprinting, and session reconstruction into one focused hunting tool. Not an enterprise SIEM — a weapon for analysts.
 
 ## Features
 
-- **PCAP/PCAPNG Ingestion** — Load and parse any capture file (dpkt fast-path, scapy fallback)
+- **PCAP/PCAPNG Ingestion** — Streaming parse (dpkt fast-path, scapy fallback) with IPv4 + IPv6; memory-bounded session accumulation so a large SPAN capture does not OOM the process
 - **Protocol Decoding** — HTTP, DNS, TLS (SNI extraction), SSH, ICMP tunnel detection
-- **TCP Session Reconstruction** — 5-tuple grouping, timestamp-ordered stream concatenation, state tracking (SYN/FIN/RST). *Full sequence-number-based reassembly (out-of-order / retransmit handling) is on the roadmap.*
+- **TCP Session Reconstruction** — 5-tuple grouping, sequence-number-ordered reassembly with retransmit dedup and a per-direction head cap, state tracking (SYN/FIN/RST). A ClientHello split across TCP segments is stitched back together before fingerprinting (so real captures fingerprint, not just single-segment fixtures).
 - **JA4+ Fingerprinting** — TLS (JA4/JA4S), HTTP (JA4H), SSH (JA4SSH) client fingerprinting via the official `ja4plus` library, with a spec-compliant JA3 fallback when `ja4plus` is unavailable
 - **C2 Beacon Detection** — Statistical jitter analysis, volume asymmetry, connection regularity, Shannon entropy scoring
 - **DNS Threat Detection** — DGA detection, DNS tunneling, suspicious query patterns
@@ -24,6 +24,21 @@ GHOSTWIRE is a developer-built network forensics engine that combines C2 beacon 
 - **Report Generator** — Markdown, text, and STIX report output
 - **Rich CLI Output** — Dark-themed terminal dashboard with tables and highlights
 - **React Dashboard + API** — Optional Fastify API server and Vite/React dashboard for browser-based hunting
+
+## Production readiness (v0.2.0)
+
+GHOSTWIRE ships the operational baseline a real tool needs, not just a demo:
+
+- **CI on every push** — ruff + mypy (strict, with `typings/` stubs so the dpkt/scapy/ja4plus boundary is not blind) + pytest (Python 3.10-3.13 matrix) + server typecheck + server tests + dashboard tests (`.github/workflows/ci.yml`).
+- **Server safety** — body/request/handler timeouts, 500 MiB PCAP pre-check (413), subprocess timeout -> SIGTERM -> SIGKILL -> 504, per-IP rate limiting, loopback-by-default + fail-closed non-loopback binding.
+- **Durable job store** — `better-sqlite3` backed; `/api/analyze` returns a `jobId` immediately and runs async, so concurrent analyses no longer clobber each other; `/api/jobs` + `/api/jobs/:id` to poll.
+- **Audit log** — append-only JSON-lines, one line per analysis, written outside the engine's write path; rotates at 100 MiB keeping the last 10.
+- **Streaming + memory-bounded** — `iter_packet_records` yields packets one at a time; per-session payload is head-capped (64 KiB) with a total-bytes counter so volume scoring survives capping; session fan-out capped at 50k.
+- **C2 IOC feeds** — `engine/feeds/` lets operators extend the runtime C2 database from cited external feed files (`ghostwire refresh-feeds`). No invented hashes; CIRCL/MISP hash feeds require a license check before bundling.
+- **Detection honesty** — a benign-traffic corpus asserts zero false positives (`beacons_detected == 0`, `c2_matches == 0`, `dns_threats == 0`); known-positive corpora assert beacons/DNS/C2-UA are detected. See `tests/corpus/README.md`.
+- **Deployment** — multi-stage Dockerfile (non-root, healthcheck), `docker compose up` single-host deploy, GHCR publish on tag (OIDC, multi-arch). PyPI is intentionally deferred.
+
+See `PRODUCTION_PLAN.md` (local-only) for the full path and `tests/corpus/README.md` for the detection-accuracy policy.
 
 ## Quick Start
 
@@ -58,6 +73,18 @@ ghostwire report capture.pcap --format markdown -o report.md
 ghostwire report capture.pcap --format stix -o report.stix.json
 ```
 
+### Docker (single-image deploy)
+
+```bash
+cp .env.example .env          # set GHOSTWIRE_API_KEY (required for non-loopback)
+docker compose up --build     # dashboard + API at http://localhost:3001
+# drop captures into ./samples/ and POST /api/analyze { "filePath": "/data/samples/x.pcap" }
+```
+
+The image binds `0.0.0.0` and refuses to start without `GHOSTWIRE_API_KEY`
+(fail-closed). Captures are read from `/data/samples` (mount `./samples:ro`);
+the SQLite job store + audit log persist in a named volume.
+
 ### Dashboard + API server (optional)
 
 ```bash
@@ -79,7 +106,15 @@ a key (fail-closed).
 | `GHOSTWIRE_HOST` | `127.0.0.1` | Bind address. Non-loopback requires `GHOSTWIRE_API_KEY`. |
 | `GHOSTWIRE_API_KEY` | unset | If set, requires `Authorization: Bearer <key>` (and `?token=` for WebSocket). Unset = open, loopback-only. |
 | `GHOSTWIRE_ALLOWED_DIRS` | `<project>/samples` | Colon-separated PCAP directory allowlist. |
+| `GHOSTWIRE_MAX_PCAP_BYTES` | `524288000` | Max PCAP size; oversize -> 413 (no subprocess spawned). |
+| `GHOSTWIRE_ANALYSIS_TIMEOUT_MS` | `240000` | Subprocess timeout -> SIGTERM -> SIGKILL -> 504. |
+| `GHOSTWIRE_RATE_MAX` / `GHOSTWIRE_RATE_WINDOW` | `20` / `1 minute` | Per-IP rate limit on `/api/analyze`. |
+| `GHOSTWIRE_DATA_DIR` | `<project>/data` | SQLite job store + audit log location. |
+| `GHOSTWIRE_FEEDS_DIR` | `engine/feeds` | C2 IOC feed directory (Phase 4.2). |
+| `GHOSTWIRE_PYTHON_BIN` | `.venv/bin/python3` | Interpreter the server shells out to. |
 | `PORT` | `3001` | API server port. |
+
+See `.env.example` for the full list.
 
 ## How It Works
 
@@ -160,9 +195,16 @@ The test suite synthesizes its own PCAPs (beacon, TLS-with-SNI, DNS-tunnel, CS-U
 - [x] Phase 2: C2 beacon detector + DNS threats + composite scoring
 - [x] Phase 3: React dashboard (timeline, beacon chart, network graph, session view, protocol breakdown, fingerprint table) + Fastify API
 - [x] Phase 4: STIX 2.1 export + MITRE ATT&CK mapping + report generator + hunt mode
-- [ ] Sequence-number-based TCP reassembly (out-of-order / retransmit handling)
+- [x] Sequence-number-based TCP reassembly (out-of-order / retransmit handling) — v0.2.0
+- [x] IPv6 parse + private-range detection — v0.2.0
+- [x] Streaming, memory-bounded analysis (no OOM on large captures) — v0.2.0
+- [x] SQLite job store + rotating audit log + async API — v0.2.0
+- [x] CI (ruff/mypy/pytest matrix + server + dashboard), Dockerfile, GHCR — v0.2.0
+- [x] C2 IOC feed loader + `refresh-feeds` CLI — v0.2.0
 - [ ] JA4X (X.509 certificate fingerprinting)
 - [ ] DNS compression-pointer handling in the response decoder
+- [ ] Runtime C2 feed fetch (currently bundled / local-dir only)
+- [ ] Multi-worker rate limiting (Redis; per-process today)
 
 ## License
 

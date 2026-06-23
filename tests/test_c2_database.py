@@ -128,3 +128,20 @@ class TestMatchAll:
         assert len(cs_matches) == 1, "Cobalt Strike should dedupe to one entry"
         # UA exact match (0.90) wins over JA4 prefix (0.70)
         assert cs_matches[0].confidence == 0.90
+
+
+class TestUANormalization:
+    """Phase 6.3: whitespace normalization must not break exact-match semantics."""
+
+    def test_trailing_space_still_matches(self):
+        ua = "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.0) "
+        assert [m.tool_name for m in match_http(ua)] == ["cobalt_strike"]
+
+    def test_doubled_internal_space_still_matches(self):
+        ua = "Mozilla/5.0  (compatible; MSIE 9.0; Windows NT 6.0)"
+        assert [m.tool_name for m in match_http(ua)] == ["cobalt_strike"]
+
+    def test_substring_still_does_not_match(self):
+        # Exact semantics preserved: an extra token must NOT match.
+        ua = "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.1; extra)"
+        assert match_http(ua) == []
