@@ -37,12 +37,12 @@ from engine.export.mitre_map import map_analysis_to_attack
 from engine.export.report import generate_markdown_report, generate_text_report, save_report
 from engine.export.stix import build_stix_bundle, iocs_from_analysis
 from engine.fingerprint.c2_database import match_all
-from engine.fingerprint.ja4_engine import fingerprint_stream as tls_fingerprint
+from engine.fingerprint.ja4_engine import fingerprint_sessions as tls_fingerprint_sessions
 from engine.fingerprint.ja4h_engine import fingerprint_stream as http_fingerprint
 from engine.fingerprint.ja4ssh_engine import fingerprint_stream as ssh_fingerprint
-from engine.parser.pcap_loader import load_pcap
+from engine.parser.pcap_loader import iter_packet_records, load_pcap
 from engine.parser.protocol import identify_protocol
-from engine.parser.session import reconstruct_sessions
+from engine.parser.session import SessionAccumulator, reconstruct_sessions
 
 console = Console()
 logger = logging.getLogger("ghostwire")
@@ -68,16 +68,36 @@ def _distinct_c2_count(all_c2_matches: dict) -> int:
 
 
 
-def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
-    """Run the full analysis pipeline and return results dict."""
-    packets = load_pcap(pcap_file, parser=parser)
+def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10,
+                         keep_packets: bool = False):
+    """Run the full analysis pipeline and return results dict.
 
-    # Protocol identification
-    for pkt in packets:
+    Streams packets from the capture (iter_packet_records) instead of loading
+    them all into memory, accumulating bounded sessions, per-packet HTTP/SSH
+    fingerprints, and DNS query metadata as packets arrive. Peak memory is
+    bounded by the session accumulator (per-direction payload cap + session cap)
+    rather than by capture size, so a large SPAN capture does not OOM the
+    process. (production-plan Phase 2.3)
+
+    keep_packets=True retains the full packet list for the report command
+    (which iterates packets for display); the production analyze path leaves
+    it False so memory stays bounded.
+    """
+    accumulator = SessionAccumulator()
+    packets: list = []
+    packets_total = 0
+    http_fps: list = []
+    ssh_fps: list = []
+    # DNS query metadata collected during the stream so we do not re-iterate a
+    # packet list at finalize.
+    dns_queries: list[tuple[str, str, str]] = []
+
+    for pkt in iter_packet_records(pcap_file, parser=parser):
+        packets_total += 1
         if pkt.raw_payload:
             result = identify_protocol(
                 pkt.src_port, pkt.dst_port, pkt.raw_payload,
-                pkt.protocol_l4, pkt.metadata
+                pkt.protocol_l4, pkt.metadata,
             )
             if result.l7_protocol:
                 pkt.protocol_l7 = result.l7_protocol
@@ -88,13 +108,28 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
                     "ssh": asdict(result.ssh) if result.ssh else None,
                     "icmp": asdict(result.icmp) if result.icmp else None,
                 }
+                dns_info = pkt.metadata["protocol_result"].get("dns")
+                if dns_info and dns_info.get("query_name"):
+                    dns_queries.append((
+                        dns_info["query_name"],
+                        dns_info.get("query_type", "A"),
+                        dns_info.get("response_code", "NOERROR"),
+                    ))
 
-    sessions = reconstruct_sessions(packets)
+        # Per-packet HTTP/SSH fingerprinting (small transient [pkt] lists).
+        if pkt.protocol_l4 == "TCP" and pkt.raw_payload:
+            http_fps.extend(http_fingerprint([pkt]))
+            ssh_fps.extend(ssh_fingerprint([pkt]))
 
-    # Fingerprinting
-    tls_fps = tls_fingerprint(packets)
-    http_fps = http_fingerprint(packets)
-    ssh_fps = ssh_fingerprint(packets)
+        accumulator.feed(pkt)
+        if keep_packets:
+            packets.append(pkt)
+
+    sessions = accumulator.build()
+
+    # TLS fingerprinting on the REASSEMBLED session streams (Phase 2.2): a
+    # ClientHello split across TCP segments is now a single complete record.
+    tls_fps = tls_fingerprint_sessions(sessions)
 
     # C2 matching — check both source and destination directions
     all_c2_matches: dict[str, list] = {}
@@ -117,21 +152,13 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
     # Beacon detection
     beacons = detect_beacons(sessions, min_packets=min_packets)
 
-    # DNS threats
+    # DNS threats (from metadata collected during the stream)
     dns_threats_objs: list[DNSThreat] = []
     dns_threats_all: list[dict] = []
-    for pkt in packets:
-        if pkt.protocol_l7 == "DNS" and pkt.metadata.get("protocol_result", {}).get("dns"):
-            dns_info = pkt.metadata["protocol_result"]["dns"]
-            if dns_info and dns_info.get("query_name"):
-                threats = analyze_dns(
-                    dns_info["query_name"],
-                    dns_info.get("query_type", "A"),
-                    dns_info.get("response_code", "NOERROR"),
-                )
-                for t in threats:
-                    dns_threats_objs.append(t)
-                    dns_threats_all.append(t.to_dict())
+    for query_name, query_type, response_code in dns_queries:
+        for t in analyze_dns(query_name, query_type, response_code):
+            dns_threats_objs.append(t)
+            dns_threats_all.append(t.to_dict())
 
     # Composite scoring
     beacon_map = {b.session_id: b for b in beacons}
@@ -157,6 +184,7 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10):
 
     return {
         "packets": packets,
+        "packets_total": packets_total,
         "sessions": sessions,
         "tls_fps": tls_fps,
         "http_fps": http_fps,
@@ -210,7 +238,7 @@ def analyze(pcap_file: str, output: str, parser: str, min_score: float, min_pack
             "ghostwire_version": __version__,
             "file": str(pcap_file),
             "analysis_time": round(elapsed, 2),
-            "packets_total": len(results["packets"]),
+            "packets_total": results["packets_total"],
             "sessions_total": len(results["sessions"]),
             "tls_fingerprints": len(results["tls_fps"]),
             "http_fingerprints": len(results["http_fps"]),
@@ -311,7 +339,7 @@ def report(pcap_file: str, fmt: str, output_file: str | None, min_score: float, 
     """Generate threat analysis report."""
 
     try:
-        results = _full_analysis(pcap_file, min_packets=min_packets)
+        results = _full_analysis(pcap_file, min_packets=min_packets, keep_packets=True)
     except (ValueError, Scapy_Exception) as exc:
         console.print(f"[red]✗ Parse error:[/] {exc}")
         console.print("[dim]The file may be corrupt or not a valid PCAP/PCAPNG capture.[/]")

@@ -284,6 +284,12 @@ def fingerprint_tls(payload: bytes, *, src_ip: str = "", dst_ip: str = "",
 def fingerprint_stream(packets: list) -> list[TLSFingerprint]:
     """Scan a list of packet records for TLS handshakes and extract fingerprints.
 
+    Per-packet path. Retained for the unit tests and as a fallback; the
+    production pipeline uses :func:`fingerprint_sessions`, which scans
+    reassembled session streams so a ClientHello split across TCP segments is
+    visible (each fragment alone is not a complete TLS record, so this
+    per-packet scan misses it). (production-plan Phase 2.2)
+
     Args:
         packets: List of PacketRecord objects.
 
@@ -308,4 +314,66 @@ def fingerprint_stream(packets: list) -> list[TLSFingerprint]:
                 fingerprints.append(fp)
 
     logger.info(f"Extracted {len(fingerprints)} TLS fingerprints")
+    return fingerprints
+
+
+def _iter_tls_handshake_records(stream: bytes):
+    """Yield (offset, record_bytes) for each complete TLS handshake record.
+
+    Walks the reassembled stream record-by-record using the TLS record header
+    (content_type(1) + version(2) + length(2)). Only handshake records
+    (content_type 0x16) that are fully contained in the captured stream are
+    yielded; an incomplete trailing record is dropped. (Phase 2.2)
+    """
+    i = 0
+    n = len(stream)
+    while i + 5 <= n:
+        content_type = stream[i]
+        rec_len = struct.unpack("!H", stream[i + 3:i + 5])[0]
+        rec_end = i + 5 + rec_len
+        if rec_end > n:
+            break  # incomplete record at the end of what we captured
+        if content_type == 0x16:  # Handshake
+            yield (i, stream[i:rec_end])
+        i = rec_end
+
+
+def fingerprint_sessions(sessions: list) -> list[TLSFingerprint]:
+    """Fingerprint TLS handshakes from REASSEMBLED session streams.
+
+    Production path. Scans each session's ``client_payload`` for a ClientHello
+    (handshake type 0x01) and ``server_payload`` for a ServerHello (0x02).
+    Because the streams are sequence-reassembled (Phase 2.4), a ClientHello
+    split across TCP segments is now a single complete record here, where the
+    per-packet :func:`fingerprint_stream` would see only fragments and miss it.
+    (production-plan Phase 2.2)
+    """
+    fingerprints: list[TLSFingerprint] = []
+
+    for s in sessions:
+        # ClientHello (JA4) lives in the client->server stream.
+        if s.client_payload:
+            for _off, rec in _iter_tls_handshake_records(s.client_payload):
+                if len(rec) > 5 and rec[5] == 0x01:  # ClientHello
+                    fp = fingerprint_tls(
+                        rec, src_ip=s.src_ip, dst_ip=s.dst_ip,
+                        src_port=s.src_port, dst_port=s.dst_port,
+                    )
+                    if fp:
+                        fingerprints.append(fp)
+                    break  # one ClientHello per session
+
+        # ServerHello (JA4S) lives in the server->client stream.
+        if s.server_payload:
+            for _off, rec in _iter_tls_handshake_records(s.server_payload):
+                if len(rec) > 5 and rec[5] == 0x02:  # ServerHello
+                    fp = fingerprint_tls(
+                        rec, src_ip=s.dst_ip, dst_ip=s.src_ip,
+                        src_port=s.dst_port, dst_port=s.src_port,
+                    )
+                    if fp:
+                        fingerprints.append(fp)
+                    break
+
+    logger.info(f"Extracted {len(fingerprints)} TLS fingerprints (session-based)")
     return fingerprints

@@ -114,3 +114,26 @@ class TestIPv6Corpus:
         assert code == 0, f"stderr: {stderr}"
         data = json.loads(stdout)
         assert data["dns_threats"] >= 1, "IPv6 DNS tunneling not detected"
+
+
+class TestSplitTLSReassembly:
+    """A ClientHello split across TCP segments must still fingerprint (Phase 2.2)."""
+
+    def test_split_client_hello_fingerprints(self, split_tls_pcap):
+        code, stdout, stderr = _run_cli("analyze", split_tls_pcap, "--output", "json")
+        assert code == 0, f"stderr: {stderr}"
+        data = json.loads(stdout)
+        assert data["tls_fingerprints"] >= 1, (
+            "Split ClientHello produced no TLS fingerprint - reassembly broken"
+        )
+
+    def test_split_client_hello_extracts_sni_and_ja4(self, split_tls_pcap):
+        """The reassembled handshake must populate ja4 and sni (the headline
+        Phase 2 fix: real captures split the ClientHello across segments)."""
+        from engine.cli import _full_analysis
+        results = _full_analysis(split_tls_pcap)
+        assert results["tls_fps"], "No TLS fingerprint extracted from split ClientHello"
+        fp = results["tls_fps"][0]
+        assert fp.sni == "evil.example.com", f"SNI not extracted: {fp.sni!r}"
+        assert fp.ja4, "JA4 empty - ja4plus did not fingerprint the reassembled hello"
+        assert fp.is_client_hello

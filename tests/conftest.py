@@ -380,6 +380,39 @@ def ipv6_dns_pcap(tmp_path) -> str:
     return str(p)
 
 
+def _build_split_tls_packets():
+    """A TLS ClientHello split across TWO TCP segments (Phase 2.2 gate).
+
+    The ClientHello bytes are split at byte offset 30 across two packets with
+    contiguous TCP sequence numbers (seq=1 len=30, then seq=31). Per-packet
+    fingerprint_stream sees only fragments (neither starts a complete record)
+    and returns nothing; after sequence-ordered reassembly the session's
+    client_payload is the whole record and fingerprint_sessions extracts ja4 + sni.
+    """
+    hello = _build_tls_client_hello("evil.example.com")
+    split = 30
+    seg1 = hello[:split]
+    seg2 = hello[split:]
+    p1 = (Ether(src=_ETHER_SRC, dst=_ETHER_DST)
+          / IP(src="192.168.1.50", dst="93.184.216.34", ttl=64)
+          / TCP(sport=49152, dport=443, flags="PA", seq=1, ack=1)
+          / Raw(load=seg1))
+    p1.time = 1.0
+    p2 = (Ether(src=_ETHER_SRC, dst=_ETHER_DST)
+          / IP(src="192.168.1.50", dst="93.184.216.34", ttl=64)
+          / TCP(sport=49152, dport=443, flags="PA", seq=1 + split, ack=1)
+          / Raw(load=seg2))
+    p2.time = 1.001
+    return [p1, p2]
+
+
+@pytest.fixture
+def split_tls_pcap(tmp_path) -> str:
+    p = tmp_path / "split_tls.pcap"
+    wrpcap(str(p), _build_split_tls_packets())
+    return str(p)
+
+
 # Exposed for unit tests that want raw bytes without touching disk
 @pytest.fixture
 def tls_client_hello_bytes() -> bytes:
