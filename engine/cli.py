@@ -83,14 +83,19 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10,
     (which iterates packets for display); the production analyze path leaves
     it False so memory stays bounded.
     """
-    accumulator = SessionAccumulator()
+    import os
+    _max_payload = int(os.environ.get("GHOSTWIRE_MAX_PAYLOAD_BYTES", 16 * 1024))
+    _max_sessions = int(os.environ.get("GHOSTWIRE_MAX_SESSIONS", 20_000))
+    accumulator = SessionAccumulator(max_payload_bytes=_max_payload, max_sessions=_max_sessions)
     packets: list = []
     packets_total = 0
     http_fps: list = []
     ssh_fps: list = []
     # DNS query metadata collected during the stream so we do not re-iterate a
     # packet list at finalize.
-    dns_queries: list[tuple[str, str, str]] = []
+    # Dedup DNS queries by (name, qtype, rcode) so a chatty real capture does
+    # not balloon this list with thousands of repeated lookups.
+    dns_queries: dict[tuple[str, str, str], None] = {}
 
     for pkt in iter_packet_records(pcap_file, parser=parser):
         packets_total += 1
@@ -110,11 +115,11 @@ def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10,
                 }
                 dns_info = pkt.metadata["protocol_result"].get("dns")
                 if dns_info and dns_info.get("query_name"):
-                    dns_queries.append((
+                    dns_queries[(
                         dns_info["query_name"],
                         dns_info.get("query_type", "A"),
                         dns_info.get("response_code", "NOERROR"),
-                    ))
+                    )] = None
 
         # Per-packet HTTP/SSH fingerprinting (small transient [pkt] lists).
         if pkt.protocol_l4 == "TCP" and pkt.raw_payload:

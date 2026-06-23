@@ -106,3 +106,35 @@ class TestSessionAccumulatorCaps:
             assert s.packet_count == e.packet_count
             assert len(s.inter_arrival_times) == len(e.inter_arrival_times)
             assert s.src_to_dst_bytes == e.src_to_dst_bytes
+
+
+class TestReassemblyEdgeCases:
+    """Closes the admitted gap: reassembly under a missing middle segment."""
+
+    def test_missing_middle_segment_does_not_crash(self):
+        from engine.parser.session import _reassemble_direction
+        # seq 1..10, then a gap (11..20 missing), then 21..30.
+        segs = [(1, b"AAAAAAAAAA"), (21, b"BBBBBBBBBB")]
+        out, total = _reassemble_direction(segs, 64 * 1024)
+        assert total == 20, f"total {total}"
+        # Head bytes are the first contiguous run; the gap leaves a hole after.
+        assert out.startswith(b"AAAAAAAAAA")
+        # The second segment is appended after the gap (not stitched over it).
+        assert b"BBBBBBBBBB" in out
+
+    def test_retransmit_overlap_skipped(self):
+        from engine.parser.session import _reassemble_direction
+        # First segment, then a retransmit overlapping it, then new data.
+        segs = [(1, b"ABCDEF"), (3, b"CDEXYZ"), (10, b"NEW")]
+        out, total = _reassemble_direction(segs, 64 * 1024)
+        assert total == 6 + 6 + 3, f"total {total}"  # all counted
+        # Head is the de-overlapped first run; NEW appended after.
+        assert out.startswith(b"ABCDEF")
+
+    def test_split_client_hello_still_in_head(self, split_tls_pcap):
+        """The split ClientHello reassembles into the head of client_payload,
+        so fingerprint_sessions finds it (Phase 2.2 gate, re-asserted)."""
+        from engine.cli import _full_analysis
+        results = _full_analysis(split_tls_pcap)
+        assert results["tls_fps"], "no TLS fp from split ClientHello"
+        assert results["tls_fps"][0].sni == "evil.example.com"

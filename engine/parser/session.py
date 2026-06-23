@@ -120,8 +120,8 @@ def _reassemble_direction(segments: list[tuple[int, bytes]], cap: int) -> tuple[
 
 
 def reconstruct_sessions(packets: list[PacketRecord], session_timeout: float = 300.0,
-                         max_payload_bytes: int = 64 * 1024,
-                         max_sessions: int = 50_000) -> list[TCPSession]:
+                         max_payload_bytes: int = 16 * 1024,
+                         max_sessions: int = 20_000) -> list[TCPSession]:
     """Reconstruct TCP sessions from packet records.
 
     Groups packets by canonical 5-tuple, reassembles each direction's payload
@@ -355,8 +355,8 @@ class SessionAccumulator:
     """
 
     def __init__(self, session_timeout: float = 300.0,
-                 max_payload_bytes: int = 64 * 1024,
-                 max_sessions: int = 50_000) -> None:
+                 max_payload_bytes: int = 16 * 1024,
+                 max_sessions: int = 20_000) -> None:
         self.session_timeout = session_timeout
         self.max_payload_bytes = max_payload_bytes
         self.max_sessions = max_sessions

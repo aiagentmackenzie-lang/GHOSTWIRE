@@ -16,6 +16,38 @@ _COMMON_TLDS = {"com", "net", "org", "edu", "gov", "mil", "io", "co", "uk", "de"
 _HEX_PATTERN = re.compile(r"^[0-9a-f]+$")
 _CONSONANT_CLUSTER = re.compile(r"[bcdfghjklmnpqrstvwxyz]{5,}", re.IGNORECASE)
 
+# DGA analysis targets the registrable label (the SLD, i.e. the label
+# immediately before the TLD), NOT the first label - because the first label is
+# often a benign host like "www" / "mail" / "ns" which is short and
+# consonant-heavy and would false-positive. DGA traditionally generates the SLD
+# itself. (Real-traffic fix: www.tunnelblick.net was flagging on "www".)
+def _registrable_label(domain: str) -> str:
+    labels = domain.split(".")
+    if len(labels) >= 2:
+        return labels[-2]
+    return domain
+
+
+# Plausible DNS query types (name or small number). Garbage qtypes (e.g. 17219,
+# 49896) come from misparsed/non-DNS UDP on real captures and must not produce
+# "tunneling" threats. (Real-traffic fix.)
+_VALID_QTYPE_NAMES = {
+    "A", "NS", "CNAME", "SOA", "PTR", "MX", "TXT", "AAAA", "SRV", "ANY",
+    "NULL", "CAA", "DS", "DNSKEY", "NSEC", "NSEC3", "TLSA", "SVCB", "HTTPS",
+    "RRSIG", "AXFR", "IXFR",
+}
+
+
+def _is_plausible_dns(domain: str, query_type: str) -> bool:
+    """Reject domains/qtypes that are obviously parser garbage."""
+    if not domain:
+        return False
+    if any(ord(c) < 32 or ord(c) > 126 for c in domain):
+        return False
+    if query_type.isdigit():
+        return int(query_type) <= 300
+    return query_type.upper() in _VALID_QTYPE_NAMES
+
 
 @dataclass
 class DNSThreat:
@@ -42,13 +74,8 @@ class DNSThreat:
 
 
 def _domain_entropy(domain: str) -> float:
-    """Calculate Shannon entropy of domain name (excluding TLD)."""
-    parts = domain.split(".")
-    if len(parts) < 2:
-        label = domain
-    else:
-        label = parts[0]  # Just the subdomain/second-level domain
-
+    """Shannon entropy of the registrable label (SLD). DGA generates the SLD."""
+    label = _registrable_label(domain)
     if not label:
         return 0.0
 
@@ -60,18 +87,18 @@ def _domain_entropy(domain: str) -> float:
 
 
 def _is_hex_domain(domain: str) -> bool:
-    """Check if domain labels are entirely hex — common DGA pattern."""
-    labels = domain.split(".")
-    if len(labels) < 2:
+    """True if the SLD (registrable label) is a long hex-only string - a DGA
+    hallmark. We do NOT flag hex *subdomains* of a legitimate SLD (e.g.
+    cb922b3f.fanoutcdn.com) because real CDNs use hash subdomains."""
+    if len(domain.split(".")) < 2:
         return False
-    # Check first label (most likely DGA part)
-    first = labels[0].replace("-", "")
-    return len(first) >= 8 and bool(_HEX_PATTERN.match(first))
+    sld = _registrable_label(domain).replace("-", "")
+    return len(sld) >= 8 and bool(_HEX_PATTERN.match(sld))
 
 
 def _consonant_ratio(domain: str) -> float:
-    """Ratio of consonants in domain — high ratio suggests DGA."""
-    label = domain.split(".")[0].replace("-", "")
+    """Consonant ratio of the SLD - high ratio suggests an algorithmic name."""
+    label = _registrable_label(domain).replace("-", "")
     if not label:
         return 0.0
     consonants = sum(1 for c in label.lower() if c in "bcdfghjklmnpqrstvwxyz")
@@ -97,7 +124,9 @@ def detect_dga(domain: str, query_type: str = "A") -> DNSThreat | None:
     known_good_slds = {
         "google", "amazon", "cloudflare", "microsoft", "apple", "facebook",
         "akamai", "fastly", "cloudfront", "azure", "aws", "github",
-        "googleapis", "gstatic",
+        "googleapis", "gstatic", "googleusercontent", "githubusercontent",
+        "amazonaws", "fanoutcdn", "cdnjs", "jsdelivr", "akamaized",
+        "cloudflarecdn", "kunlun", "edgekey", "edgesuite",
     }
     labels = domain.split(".")
     if len(labels) >= 2:
@@ -122,20 +151,23 @@ def detect_dga(domain: str, query_type: str = "A") -> DNSThreat | None:
         score += 0.35
         threat.reasons.append("Hex-only domain label — common DGA pattern")
 
-    # Consonant ratio
-    c_ratio = _consonant_ratio(domain)
-    if c_ratio > 0.75:
-        score += 0.2
-        threat.reasons.append(f"High consonant ratio ({c_ratio:.2f}) — unnatural text")
+    # Consonant ratio - only meaningful on a long enough SLD. Short org names
+    # like "dlink" / "kth" are mostly consonants by chance and would FP.
+    sld_for_ratio = _registrable_label(domain)
+    if len(sld_for_ratio) >= 6:
+        c_ratio = _consonant_ratio(domain)
+        if c_ratio > 0.75:
+            score += 0.2
+            threat.reasons.append(f"High consonant ratio ({c_ratio:.2f}) — unnatural text")
 
-    # Length check
-    first_label = domain.split(".")[0]
-    if len(first_label) > 20:
+    # Length check (on the SLD, not the first/host label)
+    sld_label = _registrable_label(domain)
+    if len(sld_label) > 20:
         score += 0.15
-        threat.reasons.append(f"Very long domain label ({len(first_label)} chars)")
+        threat.reasons.append(f"Very long SLD label ({len(sld_label)} chars)")
 
-    # Consonant cluster check
-    if _CONSONANT_CLUSTER.search(first_label):
+    # Consonant cluster check (on the SLD)
+    if _CONSONANT_CLUSTER.search(sld_label):
         score += 0.1
         threat.reasons.append("Unusual consonant cluster detected")
 
@@ -160,6 +192,19 @@ def detect_dns_tunneling(domain: str, query_type: str = "A") -> DNSThreat | None
     if not domain or domain in (".", "localhost") or domain.endswith(".arpa"):
         return None
 
+    # Skip well-known services (same registrable-SLD allowlist as DGA) so real
+    # deep-subdomain services like 1-courier.sandbox.push.apple.com do not FP.
+    _known_good = {
+        "google", "amazon", "cloudflare", "microsoft", "apple", "facebook",
+        "akamai", "fastly", "cloudfront", "azure", "aws", "github",
+        "googleapis", "gstatic", "googleusercontent", "githubusercontent",
+        "amazonaws", "fanoutcdn", "cdnjs", "jsdelivr", "akamaized",
+        "cloudflarecdn", "kunlun", "edgekey", "edgesuite",
+    }
+    labels = domain.split(".")
+    if len(labels) >= 2 and labels[-2].lower() in _known_good:
+        return None
+
     threat = DNSThreat(domain=domain, query_type=query_type)
     score = 0.0
 
@@ -169,7 +214,6 @@ def detect_dns_tunneling(domain: str, query_type: str = "A") -> DNSThreat | None
         threat.reasons.append(f"Unusual DNS query type: {query_type}")
 
     # Long subdomain labels (data exfil via DNS)
-    labels = domain.split(".")
     if labels:
         first_label = labels[0]
         if len(first_label) > 30:
@@ -179,8 +223,9 @@ def detect_dns_tunneling(domain: str, query_type: str = "A") -> DNSThreat | None
             score += 0.3
             threat.reasons.append(f"Long subdomain ({len(first_label)} chars)")
 
-    # Many subdomain levels
-    if len(labels) > 4:
+    # Deep subdomain structure - only flag at >5 levels (4-5 is common for modern
+    # CDNs / push / sandbox services).
+    if len(labels) > 5:
         score += 0.2
         threat.reasons.append(f"Deep subdomain structure ({len(labels)} levels)")
 
@@ -195,7 +240,15 @@ def detect_dns_tunneling(domain: str, query_type: str = "A") -> DNSThreat | None
 
 
 def analyze_dns(domain: str, query_type: str = "A", response_code: str = "NOERROR") -> list[DNSThreat]:
-    """Run all DNS threat detection on a domain."""
+    """Run all DNS threat detection on a domain.
+
+    Fails closed on parser garbage: a domain with control/non-ASCII bytes or an
+    implausible qtype (e.g. 17219 from a misparsed UDP packet) produces no
+    threats rather than a fake "tunneling" finding.
+    """
+    if not _is_plausible_dns(domain, query_type):
+        return []
+
     threats: list[DNSThreat] = []
 
     dga = detect_dga(domain, query_type)

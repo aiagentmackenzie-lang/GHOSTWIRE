@@ -176,3 +176,23 @@ test('a hanging analysis subprocess -> job fails (timeout)', async () => {
   const last = JSON.parse(lines[lines.length - 1]);
   assert.equal(last.status, 'failed');
 });
+
+
+test('AuditLog rotates to .1 when the size threshold is exceeded', async () => {
+  // Closes the admitted gap: the rotation *trigger* was never exercised before.
+  const { AuditLog } = await import('./audit.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-audit-'));
+  try {
+    const logPath = path.join(dir, 'audit.jsonl');
+    // Small cap so a few lines cross it; keep 3 rotations.
+    const log = new AuditLog(logPath, 256, 3);
+    for (let i = 0; i < 40; i++) {
+      log.write({ i, ts: new Date().toISOString(), padding: 'x'.repeat(60) });
+    }
+    // The active file exists and at least one .N rotation was created.
+    assert.ok(fs.existsSync(logPath), 'active log present');
+    assert.ok(fs.existsSync(logPath + '.1'), 'rotation .1 was created');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
