@@ -1,0 +1,40 @@
+# GHOSTWIRE — local dev / single-host deploy via Docker Compose.
+# Decision Q1: single image on the operator's box. Mount PCAPs into /data/samples.
+#
+# Usage:
+#   cp .env.example .env  && edit (set GHOSTWIRE_API_KEY)
+#   docker compose up --build
+#   -> dashboard + API at http://localhost:3001
+#   -> drop captures into ./samples/ and POST /api/analyze { "filePath": "/data/samples/x.pcap" }
+
+services:
+  ghostwire:
+    build: .
+    image: ghcr.io/aiagentmackenzie-lang/ghostwire:0.2.0
+    ports:
+      - "3001:3001"
+    environment:
+      # Fail-closed: the image binds 0.0.0.0 and refuses to start without a key.
+      GHOSTWIRE_API_KEY: ${GHOSTWIRE_API_KEY:?set GHOSTWIRE_API_KEY in .env}
+      GHOSTWIRE_HOST: "0.0.0.0"
+      GHOSTWIRE_ALLOWED_DIRS: /data/samples
+      GHOSTWIRE_DATA_DIR: /data
+      # Tunable safety limits (see README). Defaults shown.
+      GHOSTWIRE_MAX_PCAP_BYTES: "524288000"      # 500 MiB
+      GHOSTWIRE_ANALYSIS_TIMEOUT_MS: "240000"    # 240 s
+      GHOSTWIRE_RATE_MAX: "20"
+      GHOSTWIRE_RATE_WINDOW: "1 minute"
+    volumes:
+      # Captures to analyze (read-only mount of the host samples dir).
+      - ./samples:/data/samples:ro
+      # Persistent job DB + audit log (survives container restarts).
+      - ghostwire-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  ghostwire-data:

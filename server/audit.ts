@@ -23,16 +23,23 @@ export class AuditLog {
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
   }
 
-  /** Append one JSON line. Returns the bytes written. */
+  /** Append one JSON line. Returns the bytes written (0 on failure).
+
+  Never throws: the audit log is outside the critical analysis path and a
+  write failure (e.g. the data dir was rotated away under a long-running job)
+  must not take the server down with an uncaughtException. The error is logged
+  to stderr instead.
+  */
   write(line: Record<string, unknown>): number {
     const data = Buffer.from(JSON.stringify(line) + '\n', 'utf8');
-    fs.appendFileSync(this.logPath, data);
     try {
+      fs.appendFileSync(this.logPath, data);
       if (fs.statSync(this.logPath).size > this.maxBytes) {
         this.rotate();
       }
-    } catch {
-      // stat failure must never break the analysis path; the line was written.
+    } catch (e) {
+      console.error(`[GHOSTWIRE] audit write failed: ${(e as Error).message}`);
+      return 0;
     }
     return data.length;
   }

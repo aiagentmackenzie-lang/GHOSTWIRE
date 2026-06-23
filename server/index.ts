@@ -364,6 +364,17 @@ app.get('/api/analysis', async (_request: any, reply: any) => {
 });
 
 // --- WebSocket -------------------------------------------------------------
+// Serve the built dashboard static assets at / (Phase 5 single-image deploy).
+// Only registered when the build dir exists, so dev (Vite) and tests are unaffected.
+const DASHBOARD_DIR = process.env.GHOSTWIRE_DASHBOARD_DIR || path.join(PROJECT_ROOT, 'dashboard', 'dist');
+if (fs.existsSync(DASHBOARD_DIR)) {
+  app.register(import('@fastify/static'), {
+    root: DASHBOARD_DIR,
+    prefix: '/',
+    decorateReply: false,
+  });
+}
+
 app.register(import('@fastify/websocket'));
 app.register(async function (fastify) {
   fastify.get('/ws', { websocket: true }, (connection: any, _req: any) => {

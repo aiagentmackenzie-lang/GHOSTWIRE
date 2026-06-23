@@ -52,7 +52,7 @@ function makeJsonStub(): string {
 
 function makeHangingStub(): string {
   const p = path.join(FIXTURE_DIR, 'stub-hang.sh');
-  fs.writeFileSync(p, '#!/bin/sh\nsleep 30\nexit 0\n', { mode: 0o755 });
+  fs.writeFileSync(p, '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 });
   return p;
 }
 
