@@ -6,7 +6,7 @@
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat)
 ![Status](https://img.shields.io/badge/Status-Beta-blue?style=flat)
 
-GHOSTWIRE is a developer-built network forensics engine that combines C2 beacon detection, JA4+ fingerprinting, and session reconstruction into one focused hunting tool. Not an enterprise SIEM — a weapon for analysts.
+GHOSTWIRE is a developer-built network forensics engine that combines C2 beacon detection, JA4+ fingerprinting, and session reconstruction into one focused hunting tool. Not an enterprise SIEM — a fast, self-contained workbench for analysts.
 
 ## Features
 
@@ -19,6 +19,7 @@ GHOSTWIRE is a developer-built network forensics engine that combines C2 beacon 
 - **C2 Tool Matching** — Indicator database for Cobalt Strike, Metasploit, Sliver, Havoc, Brute Ratel, Covenant (exact User-Agent matches against documented defaults; JA4 prefix matches as research-tier hints). No fabricated JA3 hashes are shipped.
 - **Composite Threat Scoring** — Weighted scoring across all detection signals, with a strong-beacon floor so a textbook beacon is never drowned to LOW
 - **Hunt Mode** — Six built-in hunt queries (beacons, Cobalt Strike, DNS tunneling, data exfil, lateral movement, encrypted C2)
+- **Detection Mindset** — Every signal is designed for threat hunting and incident response, not automated blocking or disruption
 - **STIX 2.1 Export** — Industry-standard IOC sharing with MITRE ATT&CK relationships
 - **MITRE ATT&CK Mapping** — Detections mapped to enterprise tactics/techniques
 - **Report Generator** — Markdown, text, and STIX report output
@@ -222,4 +223,4 @@ MIT
 
 ---
 
-*Designed by Raphael Main + Agent Mackenzie. Built for analysts who hunt.*
+*Designed by Raphael Main + Agent Mackenzie. Built for analysts who hunt — defensively.*
