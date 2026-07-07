@@ -32,7 +32,7 @@ dependencies = [
     # parse_tls_handshake dict shape (keys: type/sni/ciphers/extensions/
     # supported_versions/version) that ja4_engine.py reads. Bump only after
     # re-verifying those keys in tests/test_fingerprint.py.
-    "ja4plus>=0.5,<0.6",
+    "ja4plus>=0.5,<0.7",
     "rich>=13.0",
     "click>=8.0",
 ]
