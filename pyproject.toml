@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=83.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -26,23 +26,23 @@ classifiers = [
 ]
 
 dependencies = [
-    "scapy>=2.6",
+    "scapy>=2.7.0",
     "dpkt>=1.9.8",
     # ja4plus: pin to a compatible range — a major bump could change the
     # parse_tls_handshake dict shape (keys: type/sni/ciphers/extensions/
     # supported_versions/version) that ja4_engine.py reads. Bump only after
     # re-verifying those keys in tests/test_fingerprint.py.
-    "ja4plus>=0.5,<0.6",
-    "rich>=13.0",
-    "click>=8.0",
+    "ja4plus>=0.6.0,<0.7",
+    "rich>=15.0.0",
+    "click>=8.4.2",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.1.1",
     "pytest-cov",
-    "ruff>=0.6",
-    "mypy>=1.10",
+    "ruff>=0.16.0",
+    "mypy>=2.3.0",
 ]
 
 [project.scripts]
