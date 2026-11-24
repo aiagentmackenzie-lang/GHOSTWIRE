@@ -1,3 +1,11 @@
+# NOTE: this file is intentionally NOT named ci.yml.
+#
+# On 2026-11-23 the workflow record at .github/workflows/ci.yml was found
+# `disabled_manually` (last main run: 2026-07-02). Re-enabling it produced
+# dispatches that queued with zero jobs and swallowed every later push event,
+# while a fresh workflow file on the same push ran normally. Moving the
+# pipeline to a new path re-registered it (workflow id 428514997) and push
+# gating resumed. Renaming it back would re-attach the wedged record.
 name: CI
 
 on:
