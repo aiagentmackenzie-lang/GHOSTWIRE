@@ -24,6 +24,29 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# Algorithm identifiers are part of the result contract: a JA3 value is only
+# comparable with another value produced by the same algorithm revision.
+# 0.2.x hashed the five JA3 fields with comma delimiters between every element
+# (no intra-field delimiter). That disagrees with the published JA3 spec, where
+# list elements are joined with '-' and the five fields with ','. Values saved
+# by those releases are still identifiable by their producing revision below.
+JA3_ALGORITHM = "ja3-rfc-v1"
+LEGACY_JA3_ALGORITHM = "ghostwire-ja3-comma-v0.2"
+JA3_ALGORITHM_REVISIONS: dict[str, str] = {
+    JA3_ALGORITHM: "TLSVersion,Ciphers,Extensions,Curves,PointFormats with '-' inside lists",
+    LEGACY_JA3_ALGORITHM: "0.2.x comma-joined every element (not JA3-spec compatible)",
+}
+
+
+def ja4_engine_version() -> str:
+    """Version of the JA4 implementation that produced the values."""
+    try:
+        import ja4plus
+        return f"ja4plus-{getattr(ja4plus, '__version__', 'unknown')}"
+    except ImportError:
+        return "unavailable"
+
+
 # ─── Optional dependencies ────────────────────────────────────────────────
 _HAS_JA4PLUS = False
 try:
@@ -49,6 +72,8 @@ class TLSFingerprint:
     ja4: str = ""
     ja4s: str = ""
     ja3_hash: str = ""  # Fallback / supplementary
+    ja3_algorithm: str = JA3_ALGORITHM
+    ja4_engine: str = ""
     sni: str = ""
     tls_version: str = ""
     cipher_count: int = 0
@@ -59,17 +84,30 @@ class TLSFingerprint:
     destination_ip: str = ""
     source_port: int = 0
     destination_port: int = 0
+    # Evidence anchoring back to the conversation and reconstructed stream
+    session_id: str = ""
+    stream_direction: str = ""   # "src_to_dst" | "dst_to_src"
+    record_offset: int = 0        # byte offset into the stored stream prefix
+    record_length: int = 0
+    role_basis: str = ""
 
     def to_dict(self) -> dict:
         return {
             "ja4": self.ja4,
             "ja4s": self.ja4s,
             "ja3_hash": self.ja3_hash,
+            "ja3_algorithm": self.ja3_algorithm,
+            "ja4_engine": self.ja4_engine or None,
             "sni": self.sni,
             "tls_version": self.tls_version,
             "cipher_count": self.cipher_count,
             "ext_count": self.ext_count,
             "direction": "client_hello" if self.is_client_hello else "server_hello" if self.is_server_hello else "unknown",
+            "session_id": self.session_id or None,
+            "stream_direction": self.stream_direction or None,
+            "record_offset": self.record_offset,
+            "record_length": self.record_length,
+            "role_basis": self.role_basis or None,
         }
 
 
@@ -175,8 +213,29 @@ def _compute_ja3(parsed: dict) -> str:
     """Compute a spec-compliant JA3 hash.
 
     JA3 = MD5(TLSVersion,Ciphers,Extensions,EllipticCurves,EllipticCurvePointFormats)
-    All five fields are populated from the parsed ClientHello, so the hash
-    matches the format published in JA3er / public datasets.
+    where list elements inside each field are joined with ``-`` and the five
+    fields are joined with ``,`` (salesforce/ja3). All five fields are
+    populated from the parsed ClientHello, so the hash matches the format
+    published in JA3er / public datasets and the values emitted by Wireshark.
+
+    Historical note: 0.2.x joined every element with ``,``. Reproduce that
+    value with :func:`legacy_comma_ja3` when comparing an old saved digest;
+    never mix the two in a lookup table.
+    """
+    full = "{},{},{},{},{}".format(
+        parsed["version"],
+        "-".join(str(c) for c in parsed["ciphers"]),
+        "-".join(str(e) for e in parsed["extensions"]),
+        "-".join(str(g) for g in parsed["supported_groups"]),
+        "-".join(str(f) for f in parsed["ec_point_formats"]),
+    )
+    return hashlib.md5(full.encode()).hexdigest()
+
+
+def legacy_comma_ja3(parsed: dict) -> str:
+    """Reproduce the 0.2.x (non-spec) JA3 digest for historical comparison.
+
+    Only for labelling or cross-checking values stored by earlier releases.
     """
     full = f"{parsed['version']},{','.join(str(c) for c in parsed['ciphers'])},{','.join(str(e) for e in parsed['extensions'])},{','.join(str(g) for g in parsed['supported_groups'])},{','.join(str(f) for f in parsed['ec_point_formats'])}"
     return hashlib.md5(full.encode()).hexdigest()
@@ -217,6 +276,7 @@ def fingerprint_tls(payload: bytes, *, src_ip: str = "", dst_ip: str = "",
         destination_ip=dst_ip,
         source_port=src_port,
         destination_port=dst_port,
+        ja4_engine=ja4_engine_version(),
     )
 
     # Record-layer version (always available, even without full parsing)
@@ -341,37 +401,92 @@ def _iter_tls_handshake_records(stream: bytes):
 def fingerprint_sessions(sessions: list) -> list[TLSFingerprint]:
     """Fingerprint TLS handshakes from REASSEMBLED session streams.
 
-    Production path. Scans each session's ``client_payload`` for a ClientHello
-    (handshake type 0x01) and ``server_payload`` for a ServerHello (0x02).
-    Because the streams are sequence-reassembled (Phase 2.4), a ClientHello
-    split across TCP segments is now a single complete record here, where the
-    per-packet :func:`fingerprint_stream` would see only fragments and miss it.
-    (production-plan Phase 2.2)
+    Production path. The client/server role comes from the session's resolved
+    ``client_side`` (SYN, TLS or HTTP evidence - see
+    :func:`engine.parser.session._resolve_roles`), never from packet order.
+    That matters for a capture that begins on the server side: the visible
+    ServerHello is still recognised, and no client handshake is invented.
+
+    A stream that lost bytes to a capture gap only exposes its contiguous
+    prefix, so a record that spans the hole is not fingerprinted. (Phase 2.2,
+    Wave 1 slice 3)
     """
     fingerprints: list[TLSFingerprint] = []
 
     for s in sessions:
-        # ClientHello (JA4) lives in the client->server stream.
+        client_side = getattr(s, "client_side", "unknown")
+
+        # ── ClientHello: stream sent by the resolved client ────────────────
+        if client_side in ("src", "dst"):
+            client_dir = "src_to_dst" if client_side == "src" else "dst_to_src"
+            client_bytes = s.client_stream()
+            c_ip, c_port = s.client_endpoint()
+            srv_ip, srv_port = s.server_endpoint()
+            for off, rec in _iter_tls_handshake_records(client_bytes):
+                if len(rec) > 5 and rec[5] == 0x01:  # ClientHello
+                    fp = fingerprint_tls(
+                        rec, src_ip=c_ip, dst_ip=srv_ip,
+                        src_port=c_port, dst_port=srv_port,
+                    )
+                    if fp:
+                        fp.session_id = s.session_id
+                        fp.stream_direction = client_dir
+                        fp.record_offset = off
+                        fp.record_length = len(rec)
+                        fp.role_basis = getattr(s, "role_basis", "")
+                        fingerprints.append(fp)
+                    break  # one ClientHello per session
+
+            # ── ServerHello: stream sent by the resolved server ────────────
+            server_dir = "dst_to_src" if client_side == "src" else "src_to_dst"
+            server_bytes = s.server_stream()
+            for off, rec in _iter_tls_handshake_records(server_bytes):
+                if len(rec) > 5 and rec[5] == 0x02:  # ServerHello
+                    fp = fingerprint_tls(
+                        rec, src_ip=srv_ip, dst_ip=c_ip,
+                        src_port=srv_port, dst_port=c_port,
+                    )
+                    if fp:
+                        fp.session_id = s.session_id
+                        fp.stream_direction = server_dir
+                        fp.record_offset = off
+                        fp.record_length = len(rec)
+                        fp.role_basis = getattr(s, "role_basis", "")
+                        fingerprints.append(fp)
+                    break
+            continue
+
+        # ── Role unresolved: keep the legacy directional scan, but label the
+        # direction rather than claiming a client role. ─────────────────────
         if s.client_payload:
-            for _off, rec in _iter_tls_handshake_records(s.client_payload):
+            for off, rec in _iter_tls_handshake_records(s.client_payload):
                 if len(rec) > 5 and rec[5] == 0x01:  # ClientHello
                     fp = fingerprint_tls(
                         rec, src_ip=s.src_ip, dst_ip=s.dst_ip,
                         src_port=s.src_port, dst_port=s.dst_port,
                     )
                     if fp:
+                        fp.session_id = s.session_id
+                        fp.stream_direction = "src_to_dst"
+                        fp.record_offset = off
+                        fp.record_length = len(rec)
+                        fp.role_basis = getattr(s, "role_basis", "")
                         fingerprints.append(fp)
-                    break  # one ClientHello per session
+                    break
 
-        # ServerHello (JA4S) lives in the server->client stream.
         if s.server_payload:
-            for _off, rec in _iter_tls_handshake_records(s.server_payload):
+            for off, rec in _iter_tls_handshake_records(s.server_payload):
                 if len(rec) > 5 and rec[5] == 0x02:  # ServerHello
                     fp = fingerprint_tls(
                         rec, src_ip=s.dst_ip, dst_ip=s.src_ip,
                         src_port=s.dst_port, dst_port=s.src_port,
                     )
                     if fp:
+                        fp.session_id = s.session_id
+                        fp.stream_direction = "dst_to_src"
+                        fp.record_offset = off
+                        fp.record_length = len(rec)
+                        fp.role_basis = getattr(s, "role_basis", "")
                         fingerprints.append(fp)
                     break
 

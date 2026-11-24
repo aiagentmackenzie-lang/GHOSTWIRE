@@ -107,11 +107,15 @@ def apply_feeds(entries: list[FeedEntry], patterns: dict) -> int:
             # SSH banners/software stored alongside http_patterns for now.
         })
         if e.match_type == "ja4":
+            # (pattern, kind, source, confidence): the feed's stated weight is
+            # carried through so the matcher does not overwrite it with 0.70.
             tool_block.setdefault("ja4_patterns", []).append(
-                (e.value, "feed", e.source)
+                (e.value, "feed", e.source, e.confidence)
             )
         elif e.match_type == "ja3":
-            tool_block.setdefault("ja3_hashes", []).append(e.value)
+            tool_block.setdefault("ja3_hashes", []).append(
+                (e.value, e.confidence, e.source)
+            )
         elif e.match_type == "http_ua":
             tool_block.setdefault("http_patterns", {}).setdefault("user_agents", []).append(
                 (e.value, e.confidence, e.source)

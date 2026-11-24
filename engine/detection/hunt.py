@@ -8,7 +8,7 @@ import math
 from collections.abc import Callable
 
 from engine.parser.pcap_loader import PacketRecord
-from engine.parser.session import TCPSession
+from engine.parser.session import TCPSession, _make_session_key
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,8 @@ def hunt_suspicious_beacons(sessions: list[TCPSession]) -> list[dict]:
         if jitter < 0.3 and s.duration > 60:
             results.append({
                 "session_id": s.session_id,
+                "source": f"{s.src_ip}:{s.src_port}",
+                "destination": f"{s.dst_ip}:{s.dst_port}",
                 "jitter": round(jitter, 3),
                 "iat_mean": round(mean, 1),
                 "duration": round(s.duration, 1),
@@ -79,28 +81,53 @@ def hunt_suspicious_beacons(sessions: list[TCPSession]) -> list[dict]:
 
 
 def hunt_cobalt_strike(sessions: list[TCPSession], packets: list[PacketRecord]) -> list[dict]:
-    """Find sessions potentially using Cobalt Strike."""
-    results: list[dict[str, object]] = []
+    """Find HTTP requests whose User-Agent matches the C2 rule database.
 
-    # Check for CS user agents in HTTP traffic
-    cs_user_agents = [
-        "Mozilla/5.0 (compatible; MSIE 9.0; Windows NT 6.0)",
-        "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.1)",
-        "Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 5.1; Trident/4.0)",
-    ]
+    Uses the same exact, whitespace-normalised matcher as ``analyze``
+    (``engine.fingerprint.c2_database.match_all``) instead of a private
+    substring list, so hunt and analyze cannot disagree about a match. Each row
+    carries the frame, timestamp and observed direction that support it.
+    """
+    from engine.fingerprint.c2_database import _normalize_ua, match_http
+
+    results: list[dict[str, object]] = []
 
     for pkt in packets:
         if pkt.protocol_l4 != "TCP" or not pkt.raw_payload:
             continue
-        payload_str = pkt.raw_payload[:512].decode("utf-8", errors="replace")
-        for ua in cs_user_agents:
-            if ua in payload_str:
-                results.append({
-                    "source": f"{pkt.src_ip}:{pkt.src_port}",
-                    "destination": f"{pkt.dst_ip}:{pkt.dst_port}",
-                    "user_agent": ua,
-                    "reason": "Cobalt Strike default User-Agent detected",
-                })
+        payload = pkt.raw_payload
+        if not any(payload.startswith(m) for m in (b"GET ", b"POST ", b"HEAD ")):
+            continue
+        ua = ""
+        for line in payload.split(b"\r\n")[1:]:
+            if line.lower().startswith(b"user-agent:"):
+                ua = line.split(b":", 1)[1].decode("utf-8", errors="replace").strip()
+                break
+        if not ua:
+            continue
+        for match in match_http(ua):
+            results.append({
+                "session_id": _make_session_key(pkt.src_ip, pkt.src_port,
+                                                pkt.dst_ip, pkt.dst_port),
+                "source": f"{pkt.src_ip}:{pkt.src_port}",
+                "destination": f"{pkt.dst_ip}:{pkt.dst_port}",
+                "endpoints": {
+                    "src": {"ip": pkt.src_ip, "port": pkt.src_port, "role": "client"},
+                    "dst": {"ip": pkt.dst_ip, "port": pkt.dst_port, "role": "server"},
+                },
+                "direction": "src_to_dst",
+                "frame": pkt.frame_number,
+                "timestamp": pkt.timestamp,
+                "field": "http.header.user-agent",
+                "user_agent": ua,
+                "normalized_value": _normalize_ua(ua),
+                "rule_id": match.rule_id,
+                "match_type": match.match_type,
+                "match_source": match.source,
+                "tool_inference": match.tool_name,
+                "reason": (f"{match.tool_name} User-Agent rule matched "
+                           f"(weight {match.confidence:.2f}); tool attribution is an inference"),
+            })
 
     # Check for CS default beacon interval (60s)
     for s in sessions:
@@ -113,7 +140,14 @@ def hunt_cobalt_strike(sessions: list[TCPSession], packets: list[PacketRecord]) 
         if 55 < mean < 65:  # ~60s interval = CS default
             results.append({
                 "session_id": s.session_id,
+                "source": f"{s.src_ip}:{s.src_port}",
+                "destination": f"{s.dst_ip}:{s.dst_port}",
+                "endpoints": {
+                    "src": s.endpoint_dict("src"),
+                    "dst": s.endpoint_dict("dst"),
+                },
                 "interval": round(mean, 1),
+                "field": "tcp.inter_arrival_times",
                 "reason": "~60s beacon interval (Cobalt Strike default)",
             })
 
@@ -135,12 +169,26 @@ def hunt_dns_tunneling(packets: list[PacketRecord]) -> list[dict]:
         domain = proto.get("query_name", "")
         qtype = proto.get("query_type", "A")
 
+        endpoints = {
+            "src": {"ip": pkt.src_ip, "port": pkt.src_port,
+                    "role": "client" if proto.get("is_query") else "server"},
+            "dst": {"ip": pkt.dst_ip, "port": pkt.dst_port,
+                    "role": "server" if proto.get("is_query") else "client"},
+        }
+
         # Unusual query types
         if qtype in ("TXT", "NULL", "ANY"):
             results.append({
                 "source": f"{pkt.src_ip}:{pkt.src_port}",
+                "destination": f"{pkt.dst_ip}:{pkt.dst_port}",
+                "endpoints": endpoints,
+                "direction": "src_to_dst",
+                "frame": pkt.frame_number,
+                "timestamp": pkt.timestamp,
+                "field": "dns.query_type",
                 "domain": domain,
                 "query_type": qtype,
+                "rule_id": "hunt.dns_tunneling_shape",
                 "reason": f"Unusual DNS query type: {qtype}",
             })
 
@@ -155,9 +203,16 @@ def hunt_dns_tunneling(packets: list[PacketRecord]) -> list[dict]:
                 entropy = -sum((c / length) * math.log2(c / length) for c in freq.values())
                 results.append({
                     "source": f"{pkt.src_ip}:{pkt.src_port}",
+                    "destination": f"{pkt.dst_ip}:{pkt.dst_port}",
+                    "endpoints": endpoints,
+                    "direction": "src_to_dst",
+                    "frame": pkt.frame_number,
+                    "timestamp": pkt.timestamp,
+                    "field": "dns.query_name",
                     "domain": domain,
                     "subdomain_length": len(first_label),
                     "entropy": round(entropy, 2),
+                    "rule_id": "hunt.dns_tunneling_shape",
                     "reason": f"Long high-entropy subdomain ({len(first_label)} chars, entropy {entropy:.2f})",
                 })
 
@@ -214,6 +269,10 @@ def hunt_lateral_movement(sessions: list[TCPSession]) -> list[dict]:
                     "session_id": s.session_id,
                     "source": f"{s.src_ip}:{s.src_port}",
                     "destination": f"{s.dst_ip}:{s.dst_port}",
+                    "endpoints": {
+                        "src": s.endpoint_dict("src"),
+                        "dst": s.endpoint_dict("dst"),
+                    },
                     "protocol": s.protocol_l7,
                     "reason": f"Internal lateral movement on port {s.dst_port}",
                 })
@@ -246,7 +305,12 @@ def hunt_encrypted_c2(sessions: list[TCPSession]) -> list[dict]:
         if entropy > 7.5:
             results.append({
                 "session_id": s.session_id,
+                "source": f"{s.src_ip}:{s.src_port}",
                 "destination": f"{s.dst_ip}:{s.dst_port}",
+                "endpoints": {
+                    "src": s.endpoint_dict("src"),
+                    "dst": s.endpoint_dict("dst"),
+                },
                 "entropy": round(entropy, 2),
                 "duration": f"{s.duration:.0f}s",
                 "reason": f"Encrypted channel to external IP (entropy {entropy:.2f})",

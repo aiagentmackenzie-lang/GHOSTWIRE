@@ -71,7 +71,12 @@ def _is_netbios_name(domain: str) -> bool:
 
 @dataclass
 class DNSThreat:
-    """DNS threat detection result."""
+    """DNS threat detection result.
+
+    ``reasons`` is the human-readable list (kept for compatibility);
+    ``reason_details`` names the rule input and the score it contributed, so a
+    report can show *why* a rule fired without re-deriving it.
+    """
     domain: str = ""
     threat_type: str = ""  # "dga", "tunneling", "fast_flux", "suspicious"
     confidence: float = 0.0
@@ -80,6 +85,19 @@ class DNSThreat:
     entropy: float = 0.0
     query_type: str = ""
     response_code: str = ""
+    rule_id: str = ""
+    reason_details: list[dict] = field(default_factory=list)
+    observation_count: int = 0
+
+    def add_reason(self, code: str, detail: str, contribution: float) -> None:
+        """Record one rule input and its contribution on the rule score scale."""
+        self.reasons.append(detail)
+        self.reason_details.append({
+            "code": code,
+            "detail": detail,
+            "contribution": round(contribution, 6),
+            "scale": "rule_score_0_1",
+        })
 
     def to_dict(self) -> dict:
         return {
@@ -87,9 +105,14 @@ class DNSThreat:
             "threat_type": self.threat_type,
             "confidence": round(self.confidence, 2),
             "score": round(self.score, 3),
+            "score_scale": "rule_score_0_1",
+            "rule_id": self.rule_id or None,
             "reasons": self.reasons,
+            "reason_details": self.reason_details,
             "entropy": round(self.entropy, 3),
             "query_type": self.query_type,
+            "response_code": self.response_code,
+            "observation_count": self.observation_count,
         }
 
 
@@ -162,14 +185,15 @@ def detect_dga(domain: str, query_type: str = "A") -> DNSThreat | None:
     threat.entropy = entropy
     if entropy > 3.8:
         score += 0.4
-        threat.reasons.append(f"High domain entropy ({entropy:.2f})")
+        threat.add_reason("dga.high_entropy", f"High domain entropy ({entropy:.2f})", 0.4)
     elif entropy > 3.2:
         score += 0.2
 
     # Hex domain check
     if _is_hex_domain(domain):
         score += 0.35
-        threat.reasons.append("Hex-only domain label — common DGA pattern")
+        threat.add_reason("dga.hex_label",
+                          "Hex-only domain label — common DGA pattern", 0.35)
 
     # Consonant ratio - only meaningful on a long enough SLD. Short org names
     # like "dlink" / "kth" are mostly consonants by chance and would FP.
@@ -178,24 +202,28 @@ def detect_dga(domain: str, query_type: str = "A") -> DNSThreat | None:
         c_ratio = _consonant_ratio(domain)
         if c_ratio > 0.75:
             score += 0.2
-            threat.reasons.append(f"High consonant ratio ({c_ratio:.2f}) — unnatural text")
+            threat.add_reason("dga.consonant_ratio",
+                              f"High consonant ratio ({c_ratio:.2f}) — unnatural text", 0.2)
 
     # Length check (on the SLD, not the first/host label)
     sld_label = _registrable_label(domain)
     if len(sld_label) > 20:
         score += 0.15
-        threat.reasons.append(f"Very long SLD label ({len(sld_label)} chars)")
+        threat.add_reason("dga.long_sld",
+                          f"Very long SLD label ({len(sld_label)} chars)", 0.15)
 
     # Consonant cluster check (on the SLD)
     if _CONSONANT_CLUSTER.search(sld_label):
         score += 0.1
-        threat.reasons.append("Unusual consonant cluster detected")
+        threat.add_reason("dga.consonant_cluster",
+                          "Unusual consonant cluster detected", 0.1)
 
     if score < 0.2:
         return None
 
     threat.score = min(score, 1.0)
     threat.threat_type = "dga"
+    threat.rule_id = "dns.dga_heuristic"
     threat.confidence = min(score, 1.0)
 
     return threat
@@ -231,29 +259,37 @@ def detect_dns_tunneling(domain: str, query_type: str = "A") -> DNSThreat | None
     # Unusual query types
     if query_type in ("TXT", "NULL", "ANY"):
         score += 0.5
-        threat.reasons.append(f"Unusual DNS query type: {query_type}")
+        threat.add_reason("dns.unusual_qtype",
+                          f"Unusual DNS query type: {query_type}", 0.5)
 
     # Long subdomain labels (data exfil via DNS)
     if labels:
         first_label = labels[0]
         if len(first_label) > 30:
             score += 0.5
-            threat.reasons.append(f"Extremely long subdomain ({len(first_label)} chars) — possible data encoding")
+            threat.add_reason(
+                "dns.long_label",
+                f"Extremely long subdomain ({len(first_label)} chars) — possible data encoding",
+                0.5,
+            )
         elif len(first_label) > 20:
             score += 0.3
-            threat.reasons.append(f"Long subdomain ({len(first_label)} chars)")
+            threat.add_reason("dns.long_label",
+                              f"Long subdomain ({len(first_label)} chars)", 0.3)
 
     # Deep subdomain structure - only flag at >5 levels (4-5 is common for modern
     # CDNs / push / sandbox services).
     if len(labels) > 5:
         score += 0.2
-        threat.reasons.append(f"Deep subdomain structure ({len(labels)} levels)")
+        threat.add_reason("dns.deep_structure",
+                          f"Deep subdomain structure ({len(labels)} levels)", 0.2)
 
     if score < 0.2:
         return None
 
     threat.score = min(score, 1.0)
     threat.threat_type = "tunneling"
+    threat.rule_id = "dns.tunneling_heuristic"
     threat.confidence = min(score, 1.0)
 
     return threat

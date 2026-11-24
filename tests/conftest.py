@@ -19,6 +19,7 @@ Fixtures:
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 
 import pytest
 from scapy.all import IP, TCP, UDP, Ether, IPv6, Raw, wrpcap
@@ -47,24 +48,32 @@ def _build_beacon_packets():
     """
     import os
     pkts = []
+    # Contiguous sequence numbers per direction (a sparse sequence space would
+    # look like a capture gap to the reassembler — see coverage.stream_gaps).
+    client_seq = 0
+    server_seq = 0
     for i in range(25):
         t = float(i * 60.0)
         # Client → server: small encrypted request (24 random bytes)
         req = (
             Ether(src=_ETHER_SRC, dst=_ETHER_DST)
             / IP(src="192.168.1.50", dst="185.220.101.34", ttl=64)
-            / TCP(sport=49152, dport=443, flags="PA", seq=i * 1000, ack=i * 1000)
+            / TCP(sport=49152, dport=443, flags="PA",
+                  seq=client_seq, ack=server_seq)
             / Raw(load=os.urandom(24))
         )
         req.time = t
+        client_seq += 24
         # Server → client: larger response (300 random bytes)
         resp = (
             Ether(src=_ETHER_DST, dst=_ETHER_SRC)
             / IP(src="185.220.101.34", dst="192.168.1.50", ttl=64)
-            / TCP(sport=443, dport=49152, flags="PA", seq=i * 1000, ack=i * 1000 + 24)
+            / TCP(sport=443, dport=49152, flags="PA",
+                  seq=server_seq, ack=client_seq)
             / Raw(load=os.urandom(300))
         )
         resp.time = t + 0.5
+        server_seq += 300
         pkts.extend([req, resp])
     return pkts
 
@@ -278,22 +287,28 @@ def _build_ipv6_beacon_packets():
     """
     import os
     pkts = []
+    client_seq = 0
+    server_seq = 0
     for i in range(25):
         ts = float(i * 60.0)
         req = (
             Ether(src=_ETHER_SRC, dst=_ETHER_DST)
             / IPv6(src="fd00::50", dst="2001:db8:dead::beef", hlim=64)
-            / TCP(sport=49152, dport=443, flags="PA", seq=i * 1000, ack=i * 1000)
+            / TCP(sport=49152, dport=443, flags="PA",
+                  seq=client_seq, ack=server_seq)
             / Raw(load=os.urandom(24))
         )
         req.time = ts
+        client_seq += 24
         resp = (
             Ether(src=_ETHER_DST, dst=_ETHER_SRC)
             / IPv6(src="2001:db8:dead::beef", dst="fd00::50", hlim=64)
-            / TCP(sport=443, dport=49152, flags="PA", seq=i * 1000, ack=i * 1000 + 24)
+            / TCP(sport=443, dport=49152, flags="PA",
+                  seq=server_seq, ack=client_seq)
             / Raw(load=os.urandom(300))
         )
         resp.time = ts + 0.5
+        server_seq += 300
         pkts.extend([req, resp])
     return pkts
 
@@ -350,6 +365,14 @@ def mixed_pcap(tmp_path) -> str:
 @pytest.fixture
 def c2_http_pcap(tmp_path) -> str:
     p = tmp_path / "c2_http.pcap"
+    wrpcap(str(p), _build_c2_http_packets())
+    return str(p)
+
+
+@pytest.fixture
+def http_pcap(tmp_path) -> str:
+    """Alias for the HTTP-only control used throughout the Wave 1 tests."""
+    p = tmp_path / "http.pcap"
     wrpcap(str(p), _build_c2_http_packets())
     return str(p)
 
@@ -417,3 +440,166 @@ def split_tls_pcap(tmp_path) -> str:
 @pytest.fixture
 def tls_client_hello_bytes() -> bytes:
     return _build_tls_client_hello("evil.example.com")
+
+
+# ─── Wave 1 acceptance fixtures ─────────────────────────────────────────────
+#
+# These express the evidence distinctions the earlier suite missed: a DNS query
+# with no TCP session, two conversations that share a client address, a
+# duplicated TCP segment, a capture that lost 19 bytes mid-record, a reversed
+# file order, and a capture that begins on the server side.
+
+def _build_benign_http_packets(sport: int = 50000, dst: str = "203.0.113.10",
+                               ua: str = "Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0",
+                               ts: float = 1.0):
+    """One ordinary HTTP request — the negative control for a UA rule match."""
+    req = (f"GET /index.html HTTP/1.1\r\nHost: benign.example\r\n"
+           f"User-Agent: {ua}\r\n\r\n").encode()
+    pkt = (
+        Ether(src=_ETHER_SRC, dst=_ETHER_DST)
+        / IP(src="192.168.1.50", dst=dst, ttl=64)
+        / TCP(sport=sport, dport=80, flags="PA", seq=1, ack=1)
+        / Raw(load=req)
+    )
+    pkt.time = ts
+    return [pkt]
+
+
+def _build_duplicate_first_segment_packets():
+    """The split ClientHello with the first 30-byte segment sent twice.
+
+    TShark marks the repeat and recovers one handshake. GHOSTWIRE must keep one
+    fingerprint, count 107 captured payload bytes (30 + 30 + 47) and 77 distinct
+    stream bytes.
+    """
+    seg1, seg2 = _build_split_tls_packets()
+    return [seg1, seg1, seg2]
+
+
+def _build_truncated_hello_packets():
+    """First segment truncated from 30 to 11 captured bytes (19 bytes lost).
+
+    The original first-frame payload length was 30, so the receiver knows 19
+    bytes are missing between sequence 12 and 31. TShark emits no complete
+    ClientHello; GHOSTWIRE must expose two disjoint ranges and 19 missing bytes
+    instead of concatenating across the hole.
+    """
+    import copy
+    seg1, seg2 = _build_split_tls_packets()
+    truncated = copy.deepcopy(seg1)
+    truncated[Raw].load = bytes(seg1[Raw].load)[:11]
+    truncated.time = 1.0
+    # The captured length shrinks; the IP total length still claims the
+    # original, which is exactly how a snaplen-limited capture looks.
+    return [truncated, seg2]
+
+
+def _build_reversed_split_packets():
+    """The split handshake written in reverse file order, timestamps preserved.
+
+    The capture still spans 1 ms. The stream bytes are contiguous, so payload
+    reconstruction is fine; the *timing* is not in file order and must be
+    reported as an ordering anomaly with a positive span.
+    """
+    seg1, seg2 = _build_split_tls_packets()
+    return [seg2, seg1]
+
+
+@pytest.fixture
+def dns_plus_http_pcap(tmp_path) -> str:
+    """The HTTP fixture appended after a DNS query to a different destination.
+
+    The DNS query is not evidence about the HTTP conversation: the HTTP session
+    score must stay 0.315.
+    """
+    p = tmp_path / "dns_plus_http.pcap"
+    wrpcap(str(p), _build_dns_packets() + _build_c2_http_packets())
+    return str(p)
+
+
+@pytest.fixture
+def http_with_shared_client_pcap(tmp_path) -> str:
+    """Two HTTP conversations from the same client address.
+
+    Only the first carries the C2 User-Agent. The second must gain no match,
+    no finding and no score contribution.
+    """
+    p = tmp_path / "two_http_sessions.pcap"
+    wrpcap(str(p), _build_c2_http_packets() + _build_benign_http_packets(ts=2.0))
+    return str(p)
+
+
+@pytest.fixture
+def duplicate_segment_pcap(tmp_path) -> str:
+    p = tmp_path / "duplicate_segment.pcap"
+    wrpcap(str(p), _build_duplicate_first_segment_packets())
+    return str(p)
+
+
+@pytest.fixture
+def truncated_hello_pcap(tmp_path) -> str:
+    p = tmp_path / "truncated_hello.pcap"
+    wrpcap(str(p), _build_truncated_hello_packets())
+    return str(p)
+
+
+@pytest.fixture
+def reversed_order_pcap(tmp_path) -> str:
+    p = tmp_path / "reversed_order.pcap"
+    wrpcap(str(p), _build_reversed_split_packets())
+    return str(p)
+
+
+@pytest.fixture
+def complete_hello_pcap(tmp_path) -> str:
+    p = tmp_path / "complete_hello.pcap"
+    wrpcap(str(p), _build_tls_packets())
+    return str(p)
+
+
+# ─── Independent reference capture (Wireshark tls13-rfc8446) ────────────────
+
+_REFERENCE_FIXTURE = Path(__file__).parent / "fixtures" / "wireshark_tls13_rfc8446.json"
+
+
+def _reference_frames() -> dict:
+    import json
+    return json.loads(_REFERENCE_FIXTURE.read_text())["frames"]
+
+
+def _reference_packet(frame_no: int, ts: float | None = None):
+    meta = _reference_frames()[str(frame_no)]
+    pkt = (
+        Ether(src=_ETHER_SRC, dst=_ETHER_DST)
+        / IP(src=meta["src"], dst=meta["dst"], ttl=64)
+        / TCP(sport=meta["sport"], dport=meta["dport"], flags="PA",
+              seq=meta["seq"], ack=1)
+        / Raw(load=bytes.fromhex(meta["payload"]))
+    )
+    pkt.time = meta["ts"] if ts is None else ts
+    return pkt
+
+
+@pytest.fixture
+def wireshark_tls13_client_hellos_pcap(tmp_path) -> str:
+    """Wireshark frames 1 and 7: two ClientHellos in separate TCP streams.
+
+    Independent of this project's fixture builder. Expected JA3 values are
+    published next to the pinned upstream commit; see
+    ``tests/test_fingerprint_ja3.py``.
+    """
+    p = tmp_path / "wireshark_tls13_client_hellos.pcap"
+    wrpcap(str(p), [_reference_packet(1), _reference_packet(7)])
+    return str(p)
+
+
+@pytest.fixture
+def server_first_pcap(tmp_path) -> str:
+    """Upstream frames 2–6: recording begins on the server side.
+
+    Frame 1 of the excerpt is a ServerHello from 10.9.0.2:443. There is no
+    ClientHello in the excerpt, so no client handshake may be invented.
+    """
+    p = tmp_path / "server_first.pcap"
+    wrpcap(str(p), [_reference_packet(n) for n in (2, 3, 4, 5, 6)])
+    return str(p)

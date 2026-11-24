@@ -7,8 +7,24 @@ import fs from 'fs';
 import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
-import { JobStore } from './db.js';
+import { JobStore, type JobRequest } from './db.js';
 import { AuditLog } from './audit.js';
+import {
+  RESULT_SCHEMA_VERSION,
+  normalizeStoredResult,
+  type NormalizedResult,
+} from './legacy.js';
+
+// The engine reports its own version in every result. This constant identifies
+// the server build; /health and every job view expose both so a mismatch
+// between a stored result and the running product is visible.
+const SERVER_VERSION = '0.3.0';
+
+// Effective analysis defaults. These MUST match engine/cli.py (min_score 0.25,
+// min_packets 10): the audit found the API defaulting to 0.1/5 while the CLI
+// used 0.25/10, so two analysts got different lists from the same capture.
+export const DEFAULT_MIN_SCORE = 0.25;
+export const DEFAULT_MIN_PACKETS = 10;
 
 // --- Server safety limits (env-configurable) -------------------------------
 const BODY_LIMIT = Number(process.env.GHOSTWIRE_BODY_LIMIT_BYTES || (1 << 20));
@@ -94,7 +110,16 @@ function broadcast(message: object): void {
 }
 
 // Health check endpoint
-app.get('/health', async () => ({ status: 'ok', version: '0.2.1' }));
+app.get('/health', async () => ({
+  status: 'ok',
+  version: SERVER_VERSION,
+  result_schema_version: RESULT_SCHEMA_VERSION,
+  analysis_defaults: {
+    minScore: DEFAULT_MIN_SCORE,
+    minPackets: DEFAULT_MIN_PACKETS,
+    parser: 'auto',
+  },
+}));
 
 // --- Auth middleware --------------------------------------------------------
 // API key read once at startup (the fail-closed guard below relies on it).
@@ -321,8 +346,8 @@ app.post('/api/analyze', {
 }, async (request: any, reply: any) => {
   const body = request.body || {};
   const { filePath, parser = 'auto' } = body;
-  const minScore = typeof body.minScore === 'number' ? body.minScore : 0.1;
-  const minPackets = Number.isInteger(body.minPackets) ? body.minPackets : 5;
+  const minScore = typeof body.minScore === 'number' ? body.minScore : DEFAULT_MIN_SCORE;
+  const minPackets = Number.isInteger(body.minPackets) ? body.minPackets : DEFAULT_MIN_PACKETS;
   if (!['auto', 'dpkt', 'scapy'].includes(parser)) {
     return reply.code(400).send({ error: "parser must be 'auto', 'dpkt', or 'scapy'" });
   }
@@ -348,18 +373,60 @@ app.post('/api/analyze', {
 
   // Create the job, kick off the analysis asynchronously, return the jobId.
   // Concurrent POSTs now get distinct jobIds and do not clobber each other. (3.1)
-  const jobId = getJobs().createJob(filePath);
+  const jobId = getJobs().createJob(
+    filePath,
+    { parser, minScore, minPackets },
+  );
   runAnalysis(jobId, filePath, parser, minScore, minPackets);
-  return reply.code(202).send({ jobId, status: 'queued', filePath });
+  return reply.code(202).send({
+    jobId, status: 'queued', filePath,
+    request: { parser, minScore, minPackets },
+  });
 });
 
 function safeParse(s: string): any {
   try { return JSON.parse(s); } catch { return null; }
 }
 
+function parseRow(row: any): { row: any; raw: any } {
+  const raw = row.summary_json ? safeParse(row.summary_json) : null;
+  return { row, raw };
+}
+
+function jobView(row: any): any {
+  const { raw } = parseRow(row);
+  const normalized: NormalizedResult = normalizeStoredResult(raw);
+  return {
+    ...row,
+    // Raw payload is preserved for older clients.
+    summary: raw,
+    // Normalized view: current schema, legacy adapter, or unsupported.
+    result: normalized.result,
+    compatibility: normalized.compatibility,
+    schema_version: row.schema_version ?? normalized.compatibility.schema_version ?? null,
+    engine_version: row.engine_version
+      ?? (raw && typeof raw.ghostwire_version === 'string' ? raw.ghostwire_version : null),
+    capture_sha256: row.capture_sha256
+      ?? (raw?.run?.capture?.sha256 ?? null),
+    analysis_defaults: raw?.run?.settings ?? null,
+  };
+}
+
 app.get('/api/jobs', async (_request: any, reply: any) => {
   const rows = getJobs().list();
-  return reply.send({ jobs: rows.map((r) => ({ ...r, summary: r.summary_json ? safeParse(r.summary_json) : null })) });
+  return reply.send({
+    jobs: rows.map((r) => {
+      const view = jobView(r);
+      // List view: identity + compatibility only (the full result can be large).
+      const { result, summary, ...rest } = view;
+      return {
+        ...rest,
+        has_result: Boolean(summary),
+        schema_version: view.schema_version,
+        compatibility: view.compatibility,
+      };
+    }),
+  });
 });
 
 app.get('/api/jobs/:id', async (request: any, reply: any) => {
@@ -367,7 +434,80 @@ app.get('/api/jobs/:id', async (request: any, reply: any) => {
   if (!row) {
     return reply.code(404).send({ error: 'Job not found' });
   }
-  return reply.send({ ...row, summary: row.summary_json ? safeParse(row.summary_json) : null });
+  return reply.send(jobView(row));
+});
+
+// Explicit result endpoint: the versioned result plus an honest compatibility
+// verdict. An unsupported future schema returns 200 with the original payload
+// preserved and `compatibility.status === 'unsupported'` — never a 500 and
+// never a reinterpretation.
+app.get('/api/jobs/:id/result', async (request: any, reply: any) => {
+  const row = getJobs().get(request.params.id);
+  if (!row) {
+    return reply.code(404).send({ error: 'Job not found' });
+  }
+  const view = jobView(row);
+  if (row.status !== 'completed') {
+    return reply.code(409).send({
+      error: `Job is ${row.status}; no result is available yet.`,
+      jobId: row.id,
+      status: row.status,
+    });
+  }
+  return reply.send({
+    jobId: row.id,
+    status: row.status,
+    schema_version: view.schema_version,
+    engine_version: view.engine_version,
+    capture_sha256: view.capture_sha256,
+    compatibility: view.compatibility,
+    result: view.result,
+  });
+});
+
+// Reanalysis always creates a new job. The stored result is never rewritten,
+// so the two runs can be compared side by side.
+app.post('/api/jobs/:id/reanalyze', {
+  config: { rateLimit: { max: getRateMax(), timeWindow: getRateWindow() } },
+}, async (request: any, reply: any) => {
+  const row = getJobs().get(request.params.id);
+  if (!row) {
+    return reply.code(404).send({ error: 'Job not found' });
+  }
+  const body = request.body || {};
+  const stored = getJobs().requestFor(request.params.id);
+  const parser = body.parser ?? stored?.parser ?? 'auto';
+  const minScore = typeof body.minScore === 'number'
+    ? body.minScore
+    : (typeof stored?.minScore === 'number' ? stored.minScore : DEFAULT_MIN_SCORE);
+  const minPackets = Number.isInteger(body.minPackets)
+    ? body.minPackets
+    : (Number.isInteger(stored?.minPackets) ? stored!.minPackets : DEFAULT_MIN_PACKETS);
+  if (!['auto', 'dpkt', 'scapy'].includes(parser)) {
+    return reply.code(400).send({ error: "parser must be 'auto', 'dpkt', or 'scapy'" });
+  }
+  if (typeof minScore !== 'number' || minScore < 0 || minScore > 1) {
+    return reply.code(400).send({ error: 'minScore must be a number in [0, 1]' });
+  }
+  if (!Number.isInteger(minPackets) || minPackets < 1) {
+    return reply.code(400).send({ error: 'minPackets must be a positive integer' });
+  }
+  const pathError = validateFilePath(row.file_path);
+  if (pathError) {
+    return reply.code(400).send({ error: pathError });
+  }
+  const jobId = getJobs().createJob(
+    row.file_path, { parser, minScore, minPackets }, row.id,
+  );
+  runAnalysis(jobId, row.file_path, parser, minScore, minPackets);
+  return reply.code(202).send({
+    jobId,
+    parentJobId: row.id,
+    status: 'queued',
+    filePath: row.file_path,
+    request: { parser, minScore, minPackets },
+    capture_identity_verified: Boolean(row.capture_sha256),
+  });
 });
 
 // Back-compat: the latest completed job's summary (replaces the old

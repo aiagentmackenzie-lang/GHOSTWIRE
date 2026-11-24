@@ -39,6 +39,8 @@ class C2Match:
     matched_value: str  # The fingerprint/pattern that matched
     description: str = ""
     mitre_techniques: list[str] = field(default_factory=list)
+    source: str = "GHOSTWIRE built-in C2 rule database"
+    rule_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -48,6 +50,8 @@ class C2Match:
             "matched_value": self.matched_value,
             "description": self.description,
             "mitre_techniques": self.mitre_techniques,
+            "source": self.source,
+            "rule_id": self.rule_id or None,
         }
 
 
@@ -158,7 +162,34 @@ KNOWN_C2_PATTERNS: dict[str, dict] = {
 }
 
 
+source_default = "GHOSTWIRE built-in C2 rule database"
+
 _feeds_loaded = False
+#: What was actually merged into KNOWN_C2_PATTERNS, for run provenance.
+feeds_applied: list[dict] = []
+
+
+def _reset_feeds_for_tests() -> None:
+    """Drop feed state so a test can install its own feed directory.
+
+    Only tools that were *created* by a feed are removed; entries merged into a
+    built-in tool block stay, which mirrors the runtime behaviour of loading
+    feeds once at process start.
+    """
+    global _feeds_loaded
+    for entry in feeds_applied:
+        tool = entry["tool"]
+        block = KNOWN_C2_PATTERNS.get(tool)
+        if block is not None and block.get("description") == f"{tool} (feed-sourced)":
+            KNOWN_C2_PATTERNS.pop(tool, None)
+    feeds_applied.clear()
+    _feeds_loaded = False
+
+
+def feed_inventory() -> list[dict]:
+    """Feeds merged into the rule database, for run-level provenance."""
+    _ensure_feeds_loaded()
+    return list(feeds_applied)
 
 
 def _ensure_feeds_loaded() -> None:
@@ -182,18 +213,27 @@ def _ensure_feeds_loaded() -> None:
         entries = load_feeds_from_dir(feeds_dir)
         if entries:
             n = apply_feeds(entries, KNOWN_C2_PATTERNS)
+            for e in entries:
+                feeds_applied.append({
+                    "tool": e.tool,
+                    "match_type": e.match_type,
+                    "value": e.value,
+                    "confidence": e.confidence,
+                    "source": e.source,
+                })
             logger.info(f"Loaded {n} feed entries from {feeds_dir}")
     except Exception as e:  # never break detection on a bad feed
         logger.warning(f"Feed loading failed ({feeds_dir}): {e}")
 
 
 def match_ja4(ja4: str) -> list[C2Match]:
-    _ensure_feeds_loaded()
     """Match a JA4 fingerprint against known C2 prefix patterns.
 
     JA4 prefixes are coarse — a prefix match is a hint, not a unique
-    identifier — so confidence tiers at 0.70 (research_prefix).
+    identifier — so built-in research prefixes tier at 0.70. A feed entry
+    supplies its own confidence, which is preserved here.
     """
+    _ensure_feeds_loaded()
     if not ja4:
         return []
 
@@ -201,15 +241,20 @@ def match_ja4(ja4: str) -> list[C2Match]:
     ja4_lower = ja4.lower()
 
     for tool_name, data in KNOWN_C2_PATTERNS.items():
-        for pattern, _kind, source in data.get("ja4_patterns", []):
+        for entry in data.get("ja4_patterns", []):
+            pattern = entry[0]
+            source = entry[2] if len(entry) > 2 else source_default
+            confidence = entry[3] if len(entry) > 3 else 0.70
             if ja4_lower.startswith(pattern.lower()):
                 matches.append(C2Match(
                     tool_name=tool_name,
-                    confidence=0.70,
+                    confidence=float(confidence),
                     match_type="ja4",
                     matched_value=ja4,
                     description=f"{data['description']} (JA4 prefix match — {source})",
                     mitre_techniques=data.get("mitre", []),
+                    source=str(source),
+                    rule_id="c2.ja4_prefix",
                 ))
 
     return matches
@@ -222,6 +267,7 @@ def match_ja3(ja3: str) -> list[C2Match]:
     attributed to a published dataset; matches against attributed hashes tier
     at 0.90, unattributed entries are omitted entirely.
     """
+    _ensure_feeds_loaded()
     if not ja3:
         return []
 
@@ -230,8 +276,11 @@ def match_ja3(ja3: str) -> list[C2Match]:
 
     for tool_name, data in KNOWN_C2_PATTERNS.items():
         for known_hash in data.get("ja3_hashes", []):
+            source = source_default
             if isinstance(known_hash, tuple):
                 hash_val, conf = known_hash[0], known_hash[1]
+                if len(known_hash) > 2:
+                    source = known_hash[2]
             else:
                 hash_val, conf = known_hash, 0.90
             if ja3_lower == hash_val.lower():
@@ -242,6 +291,8 @@ def match_ja3(ja3: str) -> list[C2Match]:
                     matched_value=ja3,
                     description=data["description"],
                     mitre_techniques=data.get("mitre", []),
+                    source=str(source),
+                    rule_id="c2.ja3_exact",
                 ))
 
     return matches
@@ -261,6 +312,7 @@ def _normalize_ua(ua: str) -> str:
 
 def match_http(user_agent: str) -> list[C2Match]:
     """Match HTTP User-Agent against known C2 patterns (exact, whitespace-normalized)."""
+    _ensure_feeds_loaded()
     if not user_agent:
         return []
 
@@ -269,7 +321,7 @@ def match_http(user_agent: str) -> list[C2Match]:
 
     for tool_name, data in KNOWN_C2_PATTERNS.items():
         for entry in data.get("http_patterns", {}).get("user_agents", []):
-            known_ua, conf, _source = entry
+            known_ua, conf, source = entry[0], entry[1], entry[2] if len(entry) > 2 else source_default
             if ua_norm == _normalize_ua(known_ua):
                 matches.append(C2Match(
                     tool_name=tool_name,
@@ -278,6 +330,8 @@ def match_http(user_agent: str) -> list[C2Match]:
                     matched_value=user_agent,
                     description=data["description"],
                     mitre_techniques=data.get("mitre", []),
+                    source=str(source),
+                    rule_id="c2.http_user_agent_exact",
                 ))
 
     return matches
@@ -285,6 +339,7 @@ def match_http(user_agent: str) -> list[C2Match]:
 
 def match_ssh(banner: str, software: str) -> list[C2Match]:
     """Match SSH banner/software against known C2 patterns."""
+    _ensure_feeds_loaded()
     matches: list[C2Match] = []
 
     # SSH clients commonly used in automation/C2 tunnels. Behavioral heuristic,
@@ -299,6 +354,8 @@ def match_ssh(banner: str, software: str) -> list[C2Match]:
                 matched_value=banner,
                 description=f"SSH client using {sw} — common in automation/C2 tunnels (heuristic)",
                 mitre_techniques=["T1571", "T1021.004"],
+                source="GHOSTWIRE built-in SSH heuristic",
+                rule_id="c2.ssh_software_heuristic",
             ))
 
     return matches

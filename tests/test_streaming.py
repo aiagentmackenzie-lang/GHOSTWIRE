@@ -109,27 +109,47 @@ class TestSessionAccumulatorCaps:
 
 
 class TestReassemblyEdgeCases:
-    """Closes the admitted gap: reassembly under a missing middle segment."""
+    """Reassembly under a missing middle segment.
 
-    def test_missing_middle_segment_does_not_crash(self):
-        from engine.parser.session import _reassemble_direction
-        # seq 1..10, then a gap (11..20 missing), then 21..30.
-        segs = [(1, b"AAAAAAAAAA"), (21, b"BBBBBBBBBB")]
-        out, total = _reassemble_direction(segs, 64 * 1024)
-        assert total == 20, f"total {total}"
-        # Head bytes are the first contiguous run; the gap leaves a hole after.
-        assert out.startswith(b"AAAAAAAAAA")
-        # The second segment is appended after the gap (not stitched over it).
-        assert b"BBBBBBBBBB" in out
+    The old behaviour concatenated bytes from both sides of a capture hole into
+    one buffer, which fabricated a stream the capture never showed (audit Sweep
+    3: "the 11 bytes before the hole and 47 after it became a single 58-byte
+    buffer with no gap marker"). The contract is now: the stored payload is
+    the contiguous prefix, the disjoint range is retained separately, and the
+    hole is reported as missing bytes.
+    """
+
+    def test_missing_middle_segment_records_a_gap(self):
+        from engine.parser.session import _reassemble_direction_detail
+        # seq 1..10 captured, 11..20 missing, 21..30 captured.
+        segs = [(1, b"AAAAAAAAAA", 1), (21, b"BBBBBBBBBB", 2)]
+        detail = _reassemble_direction_detail(segs, 64 * 1024)
+        assert detail.captured_payload_bytes == 20
+        assert detail.distinct_stream_bytes == 20
+        # Stored payload is only the contiguous prefix: no fabricated join.
+        assert detail.payload == b"AAAAAAAAAA"
+        # Both ranges are retained with their supporting frames.
+        assert [(r.start, r.end, r.frames) for r in detail.ranges] == [
+            (1, 11, [1]), (21, 31, [2]),
+        ]
+        assert [(g.start, g.end, g.missing_bytes) for g in detail.gaps] == [
+            (11, 21, 10),
+        ]
+        assert detail.discontinuity is True
 
     def test_retransmit_overlap_skipped(self):
-        from engine.parser.session import _reassemble_direction
+        from engine.parser.session import _reassemble_direction_detail
         # First segment, then a retransmit overlapping it, then new data.
         segs = [(1, b"ABCDEF"), (3, b"CDEXYZ"), (10, b"NEW")]
-        out, total = _reassemble_direction(segs, 64 * 1024)
-        assert total == 6 + 6 + 3, f"total {total}"  # all counted
-        # Head is the de-overlapped first run; NEW appended after.
-        assert out.startswith(b"ABCDEF")
+        detail = _reassemble_direction_detail(segs, 64 * 1024)
+        assert detail.captured_payload_bytes == 6 + 6 + 3  # every byte on the wire
+        # Overlapping/adjacent runs merge; distinct bytes count sequence once.
+        # (1..7) + overlapping (3..9) merge to 1..9 = 8 bytes, then 10..13 = 3.
+        assert detail.distinct_stream_bytes == 11
+        assert detail.ranges[0].start == 1
+        assert detail.payload.startswith(b"ABCDEF")
+        # seq 9 was never captured, so the hole is reported, not papered over.
+        assert [(g.start, g.end, g.missing_bytes) for g in detail.gaps] == [(9, 10, 1)]
 
     def test_split_client_hello_still_in_head(self, split_tls_pcap):
         """The split ClientHello reassembles into the head of client_payload,

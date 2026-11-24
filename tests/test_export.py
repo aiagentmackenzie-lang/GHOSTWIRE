@@ -135,12 +135,18 @@ class TestReportGeneration:
         assert "Recommendations" in report
 
     def test_text_report_structure(self):
-        """Text report should have key fields."""
+        """Text report should have key fields.
+
+        The 0.2.x report printed "Threats: 0 (0 high confidence)" and omitted the
+        matched field entirely. The text report now names the counting unit
+        (findings vs session rows) instead of calling everything a threat.
+        """
         analysis = self._sample_analysis()
         report = generate_text_report(analysis)
         assert "GHOSTWIRE" in report
         assert "Packets:" in report
-        assert "Threats:" in report
+        assert "Findings:" in report
+        assert "Sessions:" in report
 
     def test_markdown_no_threats(self):
         """Report with no threats should show clean result."""

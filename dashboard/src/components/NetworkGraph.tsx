@@ -1,82 +1,117 @@
-import type { ThreatEntry } from '../App'
+import type { ThreatEntry } from '../types'
 
 interface Props {
   threats: ThreatEntry[]
 }
 
+const ROLE_COLOR: Record<string, string> = {
+  client: 'var(--primary)',
+  server: 'var(--info)',
+  unknown: 'var(--text-dim)',
+}
+
+/**
+ * Conversation graph.
+ *
+ * The 0.2.x graph read the *canonical* session key ("smaller address first") as
+ * the direction, so the request in the HTTP fixture was drawn backwards. Here
+ * the arrow follows the observed wire direction recorded on the conversation,
+ * and the node colour follows the role resolved from protocol evidence. When a
+ * legacy row has no structured endpoints the graph says so rather than guessing
+ * a direction from string order.
+ */
 export default function NetworkGraph({ threats }: Props) {
-  // Force-directed network graph showing IP connections
-  // Extract unique IPs from threat targets
-  const nodes: { id: string; type: string; score: number }[] = []
-  const edges: { from: string; to: string; score: number }[] = []
+  const edges = threats
+    .map((t) => {
+      const endpoints = t.endpoints
+      if (!endpoints) return null
+      return { src: endpoints.src, dst: endpoints.dst, score: t.overall_score, target: t.target }
+    })
+    .filter((e): e is NonNullable<typeof e> => e !== null)
 
-  threats.forEach(t => {
-    const parts = t.target.split('-')
-    if (parts.length >= 2) {
-      const src = parts[0]
-      const dst = parts[1]
-
-      if (!nodes.find(n => n.id === src)) nodes.push({ id: src, type: 'source', score: t.overall_score })
-      if (!nodes.find(n => n.id === dst)) nodes.push({ id: dst, type: 'dest', score: t.overall_score })
-      edges.push({ from: src, to: dst, score: t.overall_score })
+  const nodes: Array<{ id: string; role: string; label: string }> = []
+  for (const edge of edges) {
+    for (const side of [edge.src, edge.dst]) {
+      const id = `${side.ip}:${side.port}`
+      if (!nodes.find((n) => n.id === id)) {
+        nodes.push({ id, role: side.role, label: `${side.ip}:${side.port}` })
+      }
     }
-  })
+  }
 
-  // Simple circular layout
-  const cx = 200, cy = 80, r = 60
+  const cx = 200, cy = 82, r = 58
   const positioned = nodes.map((n, i) => {
-    const angle = (2 * Math.PI * i) / nodes.length - Math.PI / 2
+    const angle = (2 * Math.PI * i) / Math.max(nodes.length, 1) - Math.PI / 2
     return { ...n, x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) }
   })
+
+  const missing = threats.length - edges.length
 
   return (
     <div style={{
       background: 'var(--surface)', borderRadius: '8px',
       border: '1px solid var(--border)', padding: '16px',
     }}>
-      <h3 style={{ fontSize: '13px', fontWeight: 600, marginBottom: '12px', color: 'var(--text-dim)' }}>
-        🕸️ Network Graph
+      <h3 style={{ fontSize: '13px', fontWeight: 600, marginBottom: '4px', color: 'var(--text-dim)' }}>
+        🕸️ Conversation Graph
       </h3>
+      <p style={{ fontSize: '10px', color: 'var(--text-dim)', marginBottom: '8px' }}>
+        Arrow: observed wire direction (src → dst). Node colour: role inferred from
+        SYN / TLS / HTTP evidence; grey means the role could not be established.
+      </p>
 
-      <svg width="100%" height="160" viewBox="0 0 400 160">
-        {/* Edges */}
+      <svg width="100%" height="165" viewBox="0 0 400 165">
+        <defs>
+          <marker id="gw-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3" orient="auto">
+            <path d="M0,0 L6,3 L0,6 z" fill="var(--text-dim)" />
+          </marker>
+        </defs>
         {edges.map((e, i) => {
-          const from = positioned.find(n => n.id === e.from)
-          const to = positioned.find(n => n.id === e.to)
+          const from = positioned.find((n) => n.id === `${e.src.ip}:${e.src.port}`)
+          const to = positioned.find((n) => n.id === `${e.dst.ip}:${e.dst.port}`)
           if (!from || !to) return null
           return (
             <line key={i} x1={from.x} y1={from.y} x2={to.x} y2={to.y}
               stroke={e.score > 0.6 ? 'var(--danger)' : e.score > 0.3 ? 'var(--warning)' : 'var(--border)'}
-              strokeWidth={1 + e.score * 2} opacity={0.6} />
+              strokeWidth={1 + e.score * 2} opacity={0.7}
+              markerEnd="url(#gw-arrow)" />
           )
         })}
 
-        {/* Nodes */}
-        {positioned.map((n, i) => (
-          <g key={i}>
+        {positioned.map((n) => (
+          <g key={n.id}>
             <circle cx={n.x} cy={n.y} r={6}
-              fill={n.type === 'source' ? 'var(--primary)' : 'var(--danger)'}
-              opacity={0.8} />
+              fill={ROLE_COLOR[n.role] || 'var(--text-dim)'} opacity={0.85} />
             <text x={n.x} y={n.y + 18} textAnchor="middle"
               fill="var(--text-dim)" fontSize="8" fontFamily="var(--font-mono)">
-              {n.id.split(':').slice(0, 1)[0]}
+              {n.label.length > 22 ? n.label.slice(0, 21) + '…' : n.label}
             </text>
           </g>
         ))}
       </svg>
 
-      {nodes.length === 0 && (
-        <div style={{ textAlign: 'center', padding: '30px', color: 'var(--text-dim)', fontSize: '13px' }}>
-          No network connections to display
+      {edges.length === 0 && (
+        <div style={{ textAlign: 'center', padding: '24px', color: 'var(--text-dim)', fontSize: '13px' }}>
+          {threats.length === 0
+            ? 'No conversation rows to display.'
+            : 'Structured endpoints are unavailable in this result; direction cannot be shown.'}
+        </div>
+      )}
+      {missing > 0 && edges.length > 0 && (
+        <div style={{ fontSize: '10px', color: 'var(--warning)', marginTop: '4px' }}>
+          {missing} row(s) lack structured endpoints and are not drawn.
         </div>
       )}
 
-      <div style={{ display: 'flex', gap: '16px', justifyContent: 'center', marginTop: '4px' }}>
-        <span style={{ fontSize: '10px', color: 'var(--text-dim)' }}>
-          <span style={{ color: 'var(--primary)' }}>●</span> Internal
+      <div style={{ display: 'flex', gap: '14px', justifyContent: 'center', marginTop: '4px', fontSize: '10px' }}>
+        <span style={{ color: 'var(--text-dim)' }}>
+          <span style={{ color: 'var(--primary)' }}>●</span> client
         </span>
-        <span style={{ fontSize: '10px', color: 'var(--text-dim)' }}>
-          <span style={{ color: 'var(--danger)' }}>●</span> External / Threat
+        <span style={{ color: 'var(--text-dim)' }}>
+          <span style={{ color: 'var(--info)' }}>●</span> server
+        </span>
+        <span style={{ color: 'var(--text-dim)' }}>
+          <span style={{ color: 'var(--text-dim)' }}>●</span> role unknown
         </span>
       </div>
     </div>

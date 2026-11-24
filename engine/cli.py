@@ -4,6 +4,12 @@ Usage:
     ghostwire analyze <pcap_file> [--output json|summary] [--parser dpkt|scapy]
     ghostwire hunt <pcap_file> [--query <name>|--all]
     ghostwire report <pcap_file> [--format markdown|text|stix] [--output-file <path>]
+
+Every command renders the same evidence: ``engine.analysis`` produces one
+versioned result (run metadata, coverage, observations, findings, conversation
+assessments, selection counters) and the CLI only chooses how much of it to
+show. Counting units and thresholds are printed next to the numbers so an
+empty table can be told apart from an empty capture.
 """
 
 from __future__ import annotations
@@ -12,7 +18,6 @@ import json
 import logging
 import sys
 import time
-from dataclasses import asdict
 from pathlib import Path
 
 import click
@@ -29,23 +34,19 @@ except ImportError:
         """Fallback so `except (ValueError, Scapy_Exception)` is valid without scapy."""
 
 from engine import __version__
-from engine.detection.beacon import detect_beacons
-from engine.detection.dns_threats import DNSThreat, analyze_dns
+from engine.analysis import AnalysisResult, run_analysis
 from engine.detection.hunt import BUILTIN_QUERIES, run_all_hunts, run_hunt
-from engine.detection.scorer import score_session
+from engine.evidence import COVERAGE_COMPLETE, COVERAGE_LABELS
 from engine.export.mitre_map import map_analysis_to_attack
 from engine.export.report import generate_markdown_report, generate_text_report, save_report
-from engine.export.stix import build_stix_bundle, iocs_from_analysis
-from engine.fingerprint.c2_database import match_all
-from engine.fingerprint.ja4_engine import fingerprint_sessions as tls_fingerprint_sessions
-from engine.fingerprint.ja4h_engine import fingerprint_stream as http_fingerprint
-from engine.fingerprint.ja4ssh_engine import fingerprint_stream as ssh_fingerprint
-from engine.parser.pcap_loader import iter_packet_records, load_pcap
-from engine.parser.protocol import identify_protocol
-from engine.parser.session import SessionAccumulator, reconstruct_sessions
+from engine.export.stix import build_bundle_from_analysis, validate_bundle
 
 console = Console()
 logger = logging.getLogger("ghostwire")
+
+#: Historical JSON cap on returned session rows. Now surfaced in
+#: ``selection.truncation`` instead of silently applied.
+MAX_THREAT_ROWS = 50
 
 
 def _setup_logging(verbose: bool):
@@ -53,12 +54,14 @@ def _setup_logging(verbose: bool):
     logging.basicConfig(level=level, format="%(name)s %(levelname)s: %(message)s")
 
 
-def _distinct_c2_count(all_c2_matches: dict) -> int:
-    """Count distinct (tool_name, matched_value) C2 matches across all keys.
+def _distinct_c2_count(all_c2_matches: dict | None = None) -> int:
+    """Deprecated shim retained for callers of the old helper.
 
-    A single fingerprint is looked up against both src and dst direction keys,
-    so the raw sum(len(v)) double-counts. This collapses to distinct indicators.
+    Counting now happens in :mod:`engine.analysis` from findings, so two views
+    cannot disagree about what a "C2 match" is.
     """
+    if not all_c2_matches:
+        return 0
     seen = set()
     for matches in all_c2_matches.values():
         for m in matches:
@@ -66,146 +69,19 @@ def _distinct_c2_count(all_c2_matches: dict) -> int:
     return len(seen)
 
 
-
-
 def _full_analysis(pcap_file: str, parser: str = "auto", min_packets: int = 10,
-                         keep_packets: bool = False):
-    """Run the full analysis pipeline and return results dict.
+                   keep_packets: bool = False, min_score: float = 0.25) -> dict:
+    """Run the pipeline and return the internal (live-object) result dict.
 
-    Streams packets from the capture (iter_packet_records) instead of loading
-    them all into memory, accumulating bounded sessions, per-packet HTTP/SSH
-    fingerprints, and DNS query metadata as packets arrive. Peak memory is
-    bounded by the session accumulator (per-direction payload cap + session cap)
-    rather than by capture size, so a large SPAN capture does not OOM the
-    process. (production-plan Phase 2.3)
-
-    keep_packets=True retains the full packet list for the report command
-    (which iterates packets for display); the production analyze path leaves
-    it False so memory stays bounded.
+    Retained for tests and internal callers that need the TCPSession and
+    fingerprint objects. The analyst-facing shape is
+    :meth:`engine.analysis.AnalysisResult.to_output`.
     """
-    import os
-    _max_payload = int(os.environ.get("GHOSTWIRE_MAX_PAYLOAD_BYTES", 16 * 1024))
-    _max_sessions = int(os.environ.get("GHOSTWIRE_MAX_SESSIONS", 20_000))
-    accumulator = SessionAccumulator(max_payload_bytes=_max_payload, max_sessions=_max_sessions)
-    packets: list = []
-    packets_total = 0
-    # Tally L7/L4 protocol counts during the stream so the text report can
-    # show an accurate protocol breakdown WITHOUT retaining every packet
-    # (the production analyze path uses keep_packets=False for bounded memory).
-    protocol_counts: dict[str, int] = {}
-    http_fps: list = []
-    ssh_fps: list = []
-    # DNS query metadata collected during the stream so we do not re-iterate a
-    # packet list at finalize.
-    # Dedup DNS queries by (name, qtype, rcode) so a chatty real capture does
-    # not balloon this list with thousands of repeated lookups.
-    dns_queries: dict[tuple[str, str, str], None] = {}
-
-    for pkt in iter_packet_records(pcap_file, parser=parser):
-        packets_total += 1
-        _proto = pkt.protocol_l7 or pkt.protocol_l4 or "Other"
-        protocol_counts[_proto] = protocol_counts.get(_proto, 0) + 1
-        if pkt.raw_payload:
-            result = identify_protocol(
-                pkt.src_port, pkt.dst_port, pkt.raw_payload,
-                pkt.protocol_l4, pkt.metadata,
-            )
-            if result.l7_protocol:
-                pkt.protocol_l7 = result.l7_protocol
-                pkt.metadata["protocol_result"] = {
-                    "tls": asdict(result.tls) if result.tls else None,
-                    "dns": asdict(result.dns) if result.dns else None,
-                    "http": asdict(result.http) if result.http else None,
-                    "ssh": asdict(result.ssh) if result.ssh else None,
-                    "icmp": asdict(result.icmp) if result.icmp else None,
-                }
-                dns_info = pkt.metadata["protocol_result"].get("dns")
-                if dns_info and dns_info.get("query_name"):
-                    dns_queries[(
-                        dns_info["query_name"],
-                        dns_info.get("query_type", "A"),
-                        dns_info.get("response_code", "NOERROR"),
-                    )] = None
-
-        # Per-packet HTTP/SSH fingerprinting (small transient [pkt] lists).
-        if pkt.protocol_l4 == "TCP" and pkt.raw_payload:
-            http_fps.extend(http_fingerprint([pkt]))
-            ssh_fps.extend(ssh_fingerprint([pkt]))
-
-        accumulator.feed(pkt)
-        if keep_packets:
-            packets.append(pkt)
-
-    sessions = accumulator.build()
-
-    # TLS fingerprinting on the REASSEMBLED session streams (Phase 2.2): a
-    # ClientHello split across TCP segments is now a single complete record.
-    tls_fps = tls_fingerprint_sessions(sessions)
-
-    # C2 matching — check both source and destination directions
-    all_c2_matches: dict[str, list] = {}
-    for tls_fp in tls_fps:
-        for key in (f"{tls_fp.source_ip}:{tls_fp.source_port}", f"{tls_fp.destination_ip}:{tls_fp.destination_port}"):
-            matches = match_all(ja4=tls_fp.ja4, ja3=tls_fp.ja3_hash)
-            if matches:
-                all_c2_matches.setdefault(key, []).extend(matches)
-    for http_fp in http_fps:
-        for key in (http_fp.source_ip, http_fp.destination_ip):
-            matches = match_all(user_agent=http_fp.user_agent)
-            if matches:
-                all_c2_matches.setdefault(key, []).extend(matches)
-    for ssh_fp in ssh_fps:
-        for key in (ssh_fp.source_ip, ssh_fp.destination_ip):
-            matches = match_all(ssh_banner=ssh_fp.client_banner, ssh_software=ssh_fp.client_software)
-            if matches:
-                all_c2_matches.setdefault(key, []).extend(matches)
-
-    # Beacon detection
-    beacons = detect_beacons(sessions, min_packets=min_packets)
-
-    # DNS threats (from metadata collected during the stream)
-    dns_threats_objs: list[DNSThreat] = []
-    dns_threats_all: list[dict] = []
-    for query_name, query_type, response_code in dns_queries:
-        for t in analyze_dns(query_name, query_type, response_code):
-            dns_threats_objs.append(t)
-            dns_threats_all.append(t.to_dict())
-
-    # Composite scoring
-    beacon_map = {b.session_id: b for b in beacons}
-    threat_scores = []
-    for session in sessions:
-        c2 = list(all_c2_matches.get(f"{session.src_ip}:{session.src_port}", []))
-        c2 += all_c2_matches.get(f"{session.dst_ip}:{session.dst_port}", [])
-        c2 += all_c2_matches.get(session.src_ip, [])
-        c2 += all_c2_matches.get(session.dst_ip, [])
-        # Dedupe C2 matches accumulated across src/dst keys by (tool, type, value),
-        # keeping the highest-confidence entry, so the threat summary / IOC list
-        # does not show the same tool twice (e.g. 'cobalt_strike, cobalt_strike').
-        deduped: dict[tuple, object] = {}
-        for m in c2:
-            mkey = (m.tool_name, m.match_type, m.matched_value)
-            if mkey not in deduped or m.confidence > getattr(deduped[mkey], "confidence", 0):
-                deduped[mkey] = m
-        c2 = list(deduped.values())
-        # Include DNS threats in composite scoring
-        beacon = beacon_map.get(session.session_id)
-        score = score_session(session.session_id, beacon=beacon, c2_matches=c2, dns_threats=dns_threats_objs)
-        threat_scores.append(score)
-
-    return {
-        "packets": packets,
-        "packets_total": packets_total,
-        "protocol_counts": protocol_counts,
-        "sessions": sessions,
-        "tls_fps": tls_fps,
-        "http_fps": http_fps,
-        "ssh_fps": ssh_fps,
-        "all_c2_matches": all_c2_matches,
-        "beacons": beacons,
-        "dns_threats_all": dns_threats_all,
-        "threat_scores": threat_scores,
-    }
+    result = run_analysis(
+        pcap_file, parser=parser, min_packets=min_packets,
+        min_score=min_score, keep_packets=keep_packets,
+    )
+    return result.legacy_dict()
 
 
 @click.group()
@@ -222,16 +98,18 @@ def cli(verbose: bool):
               help="Output format")
 @click.option("--parser", type=click.Choice(["dpkt", "scapy", "auto"]), default="auto",
               help="PCAP parser to use")
-@click.option("--min-score", type=float, default=0.25,
-              help="Minimum threat score to report (0.0-1.0)")
-@click.option("--min-packets", type=int, default=10,
+@click.option("--min-score", type=float, default=0.25, show_default=True,
+              help="Minimum conversation score to list as a session row (0.0-1.0). "
+                   "Findings are listed regardless.")
+@click.option("--min-packets", type=int, default=10, show_default=True,
               help="Minimum packets per session for beacon analysis")
 def analyze(pcap_file: str, output: str, parser: str, min_score: float, min_packets: int):
     """Analyze a PCAP file for threats, C2 beacons, and fingerprints."""
 
     start_time = time.time()
     try:
-        results = _full_analysis(pcap_file, parser=parser, min_packets=min_packets)
+        result = run_analysis(pcap_file, parser=parser, min_packets=min_packets,
+                              min_score=min_score)
     except (ValueError, Scapy_Exception) as exc:
         console.print(f"[red]✗ Parse error:[/] {exc}")
         console.print("[dim]The file may be corrupt or not a valid PCAP/PCAPNG capture.[/]")
@@ -241,29 +119,10 @@ def analyze(pcap_file: str, output: str, parser: str, min_score: float, min_pack
         sys.exit(1)
     elapsed = time.time() - start_time
 
-    # Filter threats by min_score
-    threat_scores = [t for t in results["threat_scores"] if t.overall_score >= min_score]
-    threat_scores.sort(key=lambda s: s.overall_score, reverse=True)
-
     if output == "json":
-        result = {
-            "ghostwire_version": __version__,
-            "file": str(pcap_file),
-            "analysis_time": round(elapsed, 2),
-            "packets_total": results["packets_total"],
-            "sessions_total": len(results["sessions"]),
-            "tls_fingerprints": len(results["tls_fps"]),
-            "http_fingerprints": len(results["http_fps"]),
-            "ssh_fingerprints": len(results["ssh_fps"]),
-            "beacons_detected": len(results["beacons"]),
-            "dns_threats": len(results["dns_threats_all"]),
-            "c2_matches": _distinct_c2_count(results["all_c2_matches"]),
-            "threats": [t.to_dict() for t in threat_scores[:50]],
-        }
-        click.echo(json.dumps(result, indent=2))
-
+        click.echo(json.dumps(result.to_output(), indent=2, default=str))
     else:
-        _print_rich_summary(pcap_file, results, threat_scores, elapsed)
+        _print_rich_summary(pcap_file, result, elapsed)
 
 
 @cli.command()
@@ -273,10 +132,18 @@ def analyze(pcap_file: str, output: str, parser: str, min_score: float, min_pack
 @click.option("--all", "run_all", is_flag=True, help="Run all hunt queries")
 @click.option("--output", "-o", type=click.Choice(["json", "summary"]), default="summary")
 def hunt(pcap_file: str, query: str | None, run_all: bool, output: str):
-    """Hunt for threats using predefined queries."""
+    """Hunt for threats using predefined queries.
+
+    Hunt groups evidence differently from ``analyze`` (it returns candidate
+    observations, one row per reason), but every row carries the same frame,
+    timestamp and endpoint references so the two views can be reconciled.
+    """
+    from engine.analysis import run_analysis as _run
 
     try:
-        packets = load_pcap(pcap_file)
+        # One analysis pass supplies protocol decoding, sessions and the
+        # capture/coverage identity the rows reference.
+        analysis = _run(pcap_file, min_score=0.0, keep_packets=True)
     except (ValueError, Scapy_Exception) as exc:
         console.print(f"[red]✗ Parse error:[/] {exc}")
         console.print("[dim]The file may be corrupt or not a valid PCAP/PCAPNG capture.[/]")
@@ -285,23 +152,8 @@ def hunt(pcap_file: str, query: str | None, run_all: bool, output: str):
         console.print(f"[red]✗ File not found:[/] {exc}")
         sys.exit(1)
 
-    # Protocol identification
-    for pkt in packets:
-        if pkt.raw_payload:
-            result = identify_protocol(pkt.src_port, pkt.dst_port, pkt.raw_payload, pkt.protocol_l4, pkt.metadata)
-            if result.l7_protocol:
-                pkt.protocol_l7 = result.l7_protocol
-                # Populate metadata so hunt queries (e.g. hunt_dns_tunneling) can
-                # read decoded protocol fields via the CLI path, not just unit tests.
-                pkt.metadata["protocol_result"] = {
-                    "tls": asdict(result.tls) if result.tls else None,
-                    "dns": asdict(result.dns) if result.dns else None,
-                    "http": asdict(result.http) if result.http else None,
-                    "ssh": asdict(result.ssh) if result.ssh else None,
-                    "icmp": asdict(result.icmp) if result.icmp else None,
-                }
-
-    sessions = reconstruct_sessions(packets)
+    packets = analysis.packets
+    sessions = analysis.sessions
 
     if run_all:
         hunt_results = run_all_hunts(sessions, packets)
@@ -323,19 +175,43 @@ def hunt(pcap_file: str, query: str | None, run_all: bool, output: str):
         return
 
     if output == "json":
-        click.echo(json.dumps(hunt_results, indent=2, default=str))
+        payload = {
+            **hunt_results,
+            "_meta": {
+                "schema_version": analysis.run.schema_version,
+                "ghostwire_version": __version__,
+                "run": analysis.run.to_dict(),
+                "coverage": analysis.coverage.to_dict(),
+                "counting": {
+                    "unit": "one row per candidate observation or reason",
+                    "note": ("Hunt rows are pre-selection: they are not filtered by "
+                             "--min-score and do not imply a conversation score."),
+                },
+            },
+        }
+        click.echo(json.dumps(payload, indent=2, default=str))
     else:
         console.print()
         console.print(Panel.fit("[bold green]GHOSTWIRE[/] Hunt Results", border_style="green"))
+        console.print(
+            f"[dim]Capture {analysis.run.capture.get('sha256', '')[:16]}… · "
+            f"coverage: {analysis.coverage.status} · "
+            f"{analysis.coverage.frames_decoded}/{analysis.coverage.frames_read} frames decoded[/]"
+        )
+        if analysis.coverage.status != COVERAGE_COMPLETE:
+            for reason in analysis.coverage.reasons:
+                console.print(f"[yellow]![/] {reason}")
         for name, findings in hunt_results.items():
             meta = BUILTIN_QUERIES.get(name, {})
-            console.print(f"\n[bold]{meta.get('name', name)}[/] — {len(findings)} findings")
+            console.print(f"\n[bold]{meta.get('name', name)}[/] — {len(findings)} row(s)")
             if findings:
                 for f in findings[:10]:
                     reason = f.get("reason", "")
-                    console.print(f"  [dim]•[/] {reason}")
+                    where = f.get("frame")
+                    where_txt = f" [dim](frame {where})[/]" if where else ""
+                    console.print(f"  [dim]•[/] {reason}{where_txt}")
             else:
-                console.print("  [dim]No findings[/]")
+                console.print("  [dim]No observations matched this query[/]")
 
 
 @cli.command()
@@ -343,15 +219,17 @@ def hunt(pcap_file: str, query: str | None, run_all: bool, output: str):
 @click.option("--format", "-f", "fmt", type=click.Choice(["markdown", "text", "stix"]), default="markdown",
               help="Report format")
 @click.option("--output-file", "-o", type=click.Path(), help="Output file path")
-@click.option("--min-score", type=float, default=0.25,
-              help="Minimum threat score to report (0.0-1.0)")
-@click.option("--min-packets", type=int, default=10,
+@click.option("--min-score", type=float, default=0.25, show_default=True,
+              help="Minimum conversation score to list as a session row (0.0-1.0)")
+@click.option("--min-packets", type=int, default=10, show_default=True,
               help="Minimum packets per session for beacon analysis")
 def report(pcap_file: str, fmt: str, output_file: str | None, min_score: float, min_packets: int):
     """Generate threat analysis report."""
 
+    start_time = time.time()
     try:
-        results = _full_analysis(pcap_file, min_packets=min_packets, keep_packets=True)
+        result = run_analysis(pcap_file, min_packets=min_packets,
+                              min_score=min_score, keep_packets=True)
     except (ValueError, Scapy_Exception) as exc:
         console.print(f"[red]✗ Parse error:[/] {exc}")
         console.print("[dim]The file may be corrupt or not a valid PCAP/PCAPNG capture.[/]")
@@ -359,25 +237,24 @@ def report(pcap_file: str, fmt: str, output_file: str | None, min_score: float, 
     except FileNotFoundError as exc:
         console.print(f"[red]✗ File not found:[/] {exc}")
         sys.exit(1)
+    elapsed = time.time() - start_time
 
-    analysis = {
-        "ghostwire_version": __version__,
-        "file": str(pcap_file),
-        "analysis_time": 0,
-        "packets_total": len(results["packets"]),
-        "sessions_total": len(results["sessions"]),
-        "tls_fingerprints": len(results["tls_fps"]),
-        "http_fingerprints": len(results["http_fps"]),
-        "ssh_fingerprints": len(results["ssh_fps"]),
-        "beacons_detected": len(results["beacons"]),
-        "dns_threats": len(results["dns_threats_all"]),
-        "c2_matches": _distinct_c2_count(results["all_c2_matches"]),
-        "threats": [t.to_dict() for t in results["threat_scores"] if t.overall_score >= min_score],
+    analysis = result.to_output()
+    analysis["analysis_time"] = round(elapsed, 3)
+    analysis["report"] = {
+        "selection_min_score": min_score,
+        "min_packets": min_packets,
+        "elapsed_seconds": round(elapsed, 3),
     }
+    result.elapsed_seconds = elapsed
 
     if fmt == "stix":
-        iocs = iocs_from_analysis(analysis)
-        bundle = build_stix_bundle(iocs, source_file=str(pcap_file))
+        bundle = build_bundle_from_analysis(analysis)
+        problems = validate_bundle(bundle)
+        if problems:
+            console.print("[yellow]![/] STIX structural check reported issues:")
+            for p in problems[:5]:
+                console.print(f"  [dim]{p}[/]")
         content = json.dumps(bundle, indent=2)
         if not output_file:
             output_file = str(Path(pcap_file).with_suffix(".stix.json"))
@@ -396,8 +273,12 @@ def report(pcap_file: str, fmt: str, output_file: str | None, min_score: float, 
     console.print(f"[green]✓[/] Report saved to [cyan]{output_file}[/]")
 
 
-def _print_rich_summary(pcap_file, results, threat_scores, elapsed):
-    """Print rich terminal dashboard."""
+def _print_rich_summary(pcap_file, result: AnalysisResult, elapsed: float):
+    """Print the terminal view of the same evidence the JSON carries."""
+    run = result.run
+    capture = run.capture
+    coverage = result.coverage
+
     console.print()
     console.print(Panel.fit(
         f"[bold green]GHOSTWIRE[/] v{__version__} — Network Forensics Engine\n"
@@ -405,84 +286,153 @@ def _print_rich_summary(pcap_file, results, threat_scores, elapsed):
         border_style="green",
     ))
 
-    # Overview table
     overview = Table(title="Analysis Summary", show_header=False, border_style="dim")
     overview.add_column("Key", style="cyan")
     overview.add_column("Value", style="white")
     overview.add_row("File", str(pcap_file))
-    overview.add_row("Packets", str(results["packets_total"]))
-    overview.add_row("Sessions", str(len(results["sessions"])))
-    overview.add_row("TLS Fingerprints", str(len(results["tls_fps"])))
-    overview.add_row("HTTP Fingerprints", str(len(results["http_fps"])))
-    overview.add_row("SSH Fingerprints", str(len(results["ssh_fps"])))
-    overview.add_row("C2 Matches", str(_distinct_c2_count(results["all_c2_matches"])))
-    overview.add_row("Beacons Detected", str(len(results["beacons"])))
-    overview.add_row("DNS Threats", str(len(results["dns_threats_all"])))
-    overview.add_row("Analysis Time", f"{elapsed:.2f}s")
+    overview.add_row("Capture SHA-256", capture.get("sha256", "unavailable")[:32] + "…")
+    overview.add_row("Parser", f"{capture.get('parser_used') or 'unavailable'}"
+                     + (" (fallback)" if capture.get("parser_fallback") else ""))
+    overview.add_row("Link type", str(capture.get("link_type_name") or "unknown"))
+    overview.add_row("Frames", f"{capture.get('frames_read', 0)} read, "
+                                f"{capture.get('frames_decoded', 0)} decoded")
+    overview.add_row("Time span", _fmt_duration(capture.get("duration_seconds")))
+    overview.add_row("Ordering anomalies", str(capture.get("ordering_anomalies", 0)))
+    overview.add_row("Coverage", f"{coverage.status} — {COVERAGE_LABELS.get(coverage.status, '')}")
+    overview.add_row("TCP sessions", str(len(result.sessions)))
+    overview.add_row("Findings", f"{len(result.findings)} recorded, "
+                                 f"{result.selection.counts.get('findings_returned', 0)} shown")
+    overview.add_row("Conversation rows", f"{result.selection.counts.get('sessions_returned', 0)} "
+                                          f"at min-score {result.settings.get('min_score')}")
+    overview.add_row("Beacons", str(len(result.beacons)))
+    overview.add_row("TLS / HTTP / SSH fingerprints",
+                     f"{len(result.tls_fps)} / {len(result.http_fps)} / {len(result.ssh_fps)}")
+    overview.add_row("Analysis Time", f"{elapsed:.3f}s")
     console.print(overview)
 
-    # Protocol breakdown — use the counts tallied during the streaming pass
-    # (results["protocol_counts"]) so the report is accurate even when packets
-    # were not retained (production analyze path, keep_packets=False). Falls
-    # back to re-counting from the retained packet list for the report command.
-    proto_counts: dict[str, int] = results.get("protocol_counts") or {}
-    if not proto_counts:
-        for pkt in results["packets"]:
-            p = pkt.protocol_l7 or pkt.protocol_l4 or "Other"
-            proto_counts[p] = proto_counts.get(p, 0) + 1
+    if coverage.status != COVERAGE_COMPLETE:
+        console.print(Panel("\n".join(f"• {r}" for r in coverage.reasons),
+                            title=f"[yellow]{COVERAGE_LABELS.get(coverage.status, coverage.status)}[/]",
+                            border_style="yellow"))
+    for limit in coverage.limits:
+        console.print(f"[dim]limit: {limit}[/]")
 
-    total_packets = results["packets_total"] if results["packets_total"] else len(results["packets"])
-    proto_table = Table(title="Protocol Breakdown", border_style="dim")
+    # Protocol breakdown — packet counts, one denominator.
+    proto_counts = result.protocol_counts or {}
+    total_packets = result.packets_total
+    proto_table = Table(title=f"Protocol Breakdown (denominator: {total_packets} packets)",
+                        border_style="dim")
     proto_table.add_column("Protocol", style="cyan")
     proto_table.add_column("Packets", justify="right", style="white")
     proto_table.add_column("%", justify="right", style="dim")
     if total_packets > 0:
         for proto, count in sorted(proto_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
-            pct = count / total_packets * 100
-            proto_table.add_row(proto, str(count), f"{pct:.1f}%")
+            proto_table.add_row(proto, str(count), f"{count / total_packets * 100:.1f}%")
     console.print(proto_table)
 
-    # Threats table
-    if threat_scores:
-        threat_table = Table(title="⚠ Threats Detected", border_style="red")
-        threat_table.add_column("Target", style="red")
+    # Findings — the evidence, independent of the session threshold.
+    if result.findings:
+        finding_table = Table(title="Findings (evidence, not filtered by session score)",
+                              border_style="red")
+        finding_table.add_column("Kind", style="cyan")
+        finding_table.add_column("Subject")
+        finding_table.add_column("Frame", justify="right")
+        finding_table.add_column("Rule", style="dim")
+        finding_table.add_column("Score", justify="right")
+        finding_table.add_column("Why")
+        for f in result.findings[:20]:
+            frame: str = "—"
+            if f.observation_ids:
+                obs = next((o for o in result.observations
+                            if o.observation_id == f.observation_ids[0]), None)
+                if obs is not None:
+                    frame = str(obs.frame) if obs.frame else "stream"
+            finding_table.add_row(
+                f.kind,
+                _truncate(f.subject_value, 48),
+                frame,
+                f"{f.rule_id}@r{f.rule_revision}",
+                f"{f.score:.3f}",
+                " | ".join(r.detail for r in f.reasons[:2]) or f.summary,
+            )
+        console.print(finding_table)
+        if len(result.findings) > 20:
+            console.print(f"[dim]… {len(result.findings) - 20} further finding(s) in the JSON output[/]")
+    else:
+        console.print(f"[green]✓[/] {result.summary}")
+
+    # DNS findings get their own section: they have no TCP session to sit in.
+    dns_findings = [f for f in result.findings if f.kind == "dns"]
+    if dns_findings:
+        dns_table = Table(title="DNS Findings (independent of TCP sessions)", border_style="yellow")
+        dns_table.add_column("Domain", style="yellow")
+        dns_table.add_column("Frame", justify="right")
+        dns_table.add_column("Rule")
+        dns_table.add_column("Reasons")
+        for f in dns_findings[:15]:
+            frame_no = next((o.frame for o in result.observations
+                             if f.observation_ids and o.observation_id == f.observation_ids[0]), 0)
+            dns_table.add_row(f.subject_value, str(frame_no), f.rule_id, str(len(f.reasons)))
+        console.print(dns_table)
+
+    if result.threat_scores:
+        threat_table = Table(
+            title=f"Conversation Assessments (min-score {result.settings.get('min_score')})",
+            border_style="red")
+        threat_table.add_column("Conversation", style="red")
         threat_table.add_column("Score", justify="right")
-        threat_table.add_column("Confidence", style="bold")
+        threat_table.add_column("Severity", style="bold")
+        threat_table.add_column("Findings", justify="right")
         threat_table.add_column("Summary")
-        for t in threat_scores[:20]:
-            color = "red" if t.confidence in ("HIGH", "CRITICAL") else "yellow" if t.confidence == "MEDIUM" else "dim"
+        for t in result.threat_scores[:20]:
+            color = ("red" if t.confidence in ("HIGH", "CRITICAL")
+                     else "yellow" if t.confidence == "MEDIUM" else "dim")
             threat_table.add_row(
                 t.target,
-                f"{t.overall_score:.2f}",
+                f"{t.overall_score:.3f}",
                 f"[{color}]{t.confidence}[/]",
+                str(len(t.finding_ids)),
                 t.summary,
             )
         console.print(threat_table)
+    elif result.findings:
+        console.print(Panel(
+            result.selection.explanation,
+            title="[yellow]No conversation reached the session threshold[/]",
+            border_style="yellow",
+        ))
     else:
-        console.print("[green]✓ No significant threats detected[/green]")
+        console.print(f"[green]✓[/] {result.summary}")
+
+    if result.selection.truncation.get("sessions_truncated"):
+        console.print(
+            f"[yellow]![/] Showing the first "
+            f"{result.selection.truncation.get('sessions_limit')} conversation rows; "
+            "the rest are omitted (ranked, not filtered)."
+        )
 
     # TLS fingerprints
-    if results["tls_fps"]:
+    if result.tls_fps:
         fp_table = Table(title="TLS Fingerprints", border_style="dim")
-        fp_table.add_column("Source", style="cyan")
-        fp_table.add_column("JA4/JA3")
+        fp_table.add_column("Client", style="cyan")
+        fp_table.add_column("JA4")
+        fp_table.add_column("JA3")
         fp_table.add_column("SNI", style="green")
         fp_table.add_column("Direction")
-        for fp in results["tls_fps"][:15]:
+        for fp in result.tls_fps[:15]:
             fp_table.add_row(
                 f"{fp.source_ip}:{fp.source_port}",
-                fp.ja4 or fp.ja3_hash or "—",
+                fp.ja4 or "—",
+                fp.ja3_hash or "—",
                 fp.sni or "—",
                 "Client Hello" if fp.is_client_hello else "Server Hello" if fp.is_server_hello else "—",
             )
         console.print(fp_table)
 
     # MITRE ATT&CK mapping
-    attack_map = map_analysis_to_attack({
-        "threats": [t.to_dict() for t in threat_scores]
-    })
+    attack_map = map_analysis_to_attack(result.to_output())
     if attack_map:
-        mitre_table = Table(title="MITRE ATT&CK Mapping", border_style="dim")
+        mitre_table = Table(title="MITRE ATT&CK Mapping (from matched rules)", border_style="dim")
         mitre_table.add_column("Tactic", style="cyan")
         mitre_table.add_column("Technique")
         mitre_table.add_column("ID", style="yellow")
@@ -490,7 +440,19 @@ def _print_rich_summary(pcap_file, results, threat_scores, elapsed):
             mitre_table.add_row(m.tactic, m.technique_name, m.technique_id)
         console.print(mitre_table)
 
+    console.print(f"[dim]{result.summary}[/]")
     console.print()
+
+
+def _fmt_duration(seconds) -> str:
+    if seconds is None:
+        return "unavailable"
+    return f"{seconds:.3f}s"
+
+
+def _truncate(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: width - 1] + "…"
+
 
 @cli.command("refresh-feeds")
 @click.option("--feeds-dir", "feeds_dir", type=click.Path(exists=True, file_okay=False),
