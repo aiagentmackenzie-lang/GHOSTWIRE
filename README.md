@@ -30,7 +30,7 @@ GHOSTWIRE is a developer-built network forensics engine that combines C2 beacon 
 
 GHOSTWIRE ships the operational baseline a real tool needs, not just a demo:
 
-- **CI on every push** — ruff + mypy (strict, with `typings/` stubs so the dpkt/scapy/ja4plus boundary is not blind) + pytest (Python 3.10-3.13 matrix) + server typecheck + server tests + dashboard tests (`.github/workflows/ci.yml`).
+- **CI on every push** — ruff + mypy (strict, with `typings/` stubs so the dpkt/scapy/ja4plus boundary is not blind) + pytest (Python 3.10-3.13 matrix) + server typecheck + server tests + dashboard tests (`.github/workflows/ci-pipeline.yml`).
 - **Server safety** — body/request/handler timeouts, 500 MiB PCAP pre-check (413), subprocess timeout -> SIGTERM -> SIGKILL -> 504, per-IP rate limiting, loopback-by-default + fail-closed non-loopback binding.
 - **Durable job store** — `better-sqlite3` backed; `/api/analyze` returns a `jobId` immediately and runs async, so concurrent analyses no longer clobber each other; `/api/jobs` + `/api/jobs/:id` to poll.
 - **Audit log** — append-only JSON-lines, one line per analysis, written outside the engine's write path; rotates at 100 MiB keeping the last 10.
