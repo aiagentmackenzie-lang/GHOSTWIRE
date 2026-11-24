@@ -10,8 +10,11 @@ on:
   # ungated; this makes re-gating a one-liner.
   workflow_dispatch:
 
+# Group per commit, not per ref. A run wedged in a shared ref group (observed
+# 2026-11-23: two queued runs, zero jobs, later pushes created no runs at all)
+# blocks every future commit on that branch; per-SHA grouping cannot do that.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
