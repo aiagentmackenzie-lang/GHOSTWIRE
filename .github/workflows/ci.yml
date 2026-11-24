@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual re-run without a dummy commit. The workflow was found disabled
+  # (state: disabled_manually) on 2026-11-23, so several pushes had gone
+  # ungated; this makes re-gating a one-liner.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
