@@ -13,7 +13,7 @@ GHOSTWIRE is a developer-built network forensics engine that combines C2 beacon 
 - **PCAP/PCAPNG Ingestion** — Streaming parse (dpkt fast-path, scapy fallback) with IPv4 + IPv6; memory-bounded session accumulation so a large SPAN capture does not OOM the process
 - **Protocol Decoding** — HTTP, DNS, TLS (SNI extraction), SSH, ICMP tunnel detection
 - **TCP Session Reconstruction** — 5-tuple grouping, sequence-number-ordered reassembly with retransmit dedup and a per-direction head cap, state tracking (SYN/FIN/RST). A ClientHello split across TCP segments is stitched back together before fingerprinting (so real captures fingerprint, not just single-segment fixtures).
-- **JA4+ Fingerprinting** — TLS (JA4/JA4S), HTTP (JA4H), SSH (JA4SSH) client fingerprinting via the official `ja4plus` library, with a spec-compliant JA3 fallback when `ja4plus` is unavailable
+- **JA4+ Fingerprinting** — TLS (JA4/JA4S), HTTP (JA4H), SSH (JA4SSH) client fingerprinting via the official `ja4plus` library, plus a spec-compliant JA3 computed from the parsed ClientHello (revision recorded with every result)
 - **C2 Beacon Detection** — Statistical jitter analysis, volume asymmetry, connection regularity, Shannon entropy scoring
 - **DNS Threat Detection** — DGA detection, DNS tunneling, suspicious query patterns
 - **C2 Tool Matching** — Indicator database for Cobalt Strike, Metasploit, Sliver, Havoc, Brute Ratel, Covenant (exact User-Agent matches against documented defaults; JA4 prefix matches as research-tier hints). No fabricated JA3 hashes are shipped.
@@ -26,7 +26,7 @@ GHOSTWIRE is a developer-built network forensics engine that combines C2 beacon 
 - **Rich CLI Output** — Dark-themed terminal dashboard with tables and highlights
 - **React Dashboard + API** — Optional Fastify API server and Vite/React dashboard for browser-based hunting
 
-## Production readiness (v0.2.1)
+## Production readiness (v0.3.0)
 
 GHOSTWIRE ships the operational baseline a real tool needs, not just a demo:
 
@@ -34,9 +34,11 @@ GHOSTWIRE ships the operational baseline a real tool needs, not just a demo:
 - **Server safety** — body/request/handler timeouts, 500 MiB PCAP pre-check (413), subprocess timeout -> SIGTERM -> SIGKILL -> 504, per-IP rate limiting, loopback-by-default + fail-closed non-loopback binding.
 - **Durable job store** — `better-sqlite3` backed; `/api/analyze` returns a `jobId` immediately and runs async, so concurrent analyses no longer clobber each other; `/api/jobs` + `/api/jobs/:id` to poll.
 - **Audit log** — append-only JSON-lines, one line per analysis, written outside the engine's write path; rotates at 100 MiB keeping the last 10.
-- **Streaming + memory-bounded** — `iter_packet_records` yields packets one at a time; per-session payload is head-capped (64 KiB) with a total-bytes counter so volume scoring survives capping; session fan-out capped at 50k.
+- **Streaming + memory-bounded (bounded, not a whole-process guarantee)** — `iter_packet_records` yields packets one at a time, so the capture is not held in memory. Per-direction stored payload is head-capped at **16 KiB** (`GHOSTWIRE_MAX_PAYLOAD_BYTES`) with a total-bytes counter so volume scoring survives capping; session fan-out is capped at **20,000** (`GHOSTWIRE_MAX_SESSIONS`). Inter-arrival lists and dropped-session counts still grow with traffic, and the report command retains packets for display — treat "bounded" as applying to the capture payload, not as a measured RSS ceiling. The audit's 64 KiB / 50k figures were the README's, not the code's; they now match the code.
 - **C2 IOC feeds** — `engine/feeds/` lets operators extend the runtime C2 database from cited external feed files (`ghostwire refresh-feeds`). No invented hashes; CIRCL/MISP hash feeds require a license check before bundling.
-- **Detection honesty** — a benign-traffic corpus asserts zero false positives (`beacons_detected == 0`, `c2_matches == 0`, `dns_threats == 0`); known-positive corpora assert beacons/DNS/C2-UA are detected. See `tests/corpus/README.md`.
+- **Detection honesty** — a benign-traffic corpus asserts zero findings on *synthetic* browsing traffic (`beacons_detected == 0`, `c2_matches == 0`, `dns_threats == 0`); known-positive corpora assert beacons/DNS/C2-UA are detected. These are regression controls on fixtures, **not a measured false-positive rate**: field precision/recall on held-out traffic is unmeasured (Wave 3 work). See `tests/corpus/README.md`.
+- **Evidence contract** — one versioned result (`schema_version` 1.0) answers which capture/frames, which field, which rule, and what was unavailable; `complete` / `partial` / `unsupported_decode` / `empty` coverage states are surfaced in every view. Older saved jobs open through a compatibility adapter that marks missing detail instead of guessing.
+- **Runtime** — Python 3.10+; **Node >= 22** for the server/dashboard (`engines` + `.nvmrc`; CI and Docker use 22, verified on 22 and 26). `better-sqlite3` 13 ships N-API prebuilds, so one install works across those versions.
 - **Deployment** — multi-stage Dockerfile (non-root, healthcheck), `docker compose up` single-host deploy, GHCR publish on tag (OIDC, multi-arch). PyPI is intentionally deferred.
 
 See `PRODUCTION_PLAN.md` (local-only) for the full path and `tests/corpus/README.md` for the detection-accuracy policy.
@@ -120,6 +122,8 @@ a key (fail-closed).
 | `GHOSTWIRE_RATE_MAX` / `GHOSTWIRE_RATE_WINDOW` | `20` / `1 minute` | Per-IP rate limit on `/api/analyze`. |
 | `GHOSTWIRE_DATA_DIR` | `<project>/data` | SQLite job store + audit log location. |
 | `GHOSTWIRE_FEEDS_DIR` | `engine/feeds` | C2 IOC feed directory (Phase 4.2). |
+| `GHOSTWIRE_MAX_PAYLOAD_BYTES` | `16384` | Per-direction stored-payload head cap (bytes). Volume counters still count every transmitted byte. |
+| `GHOSTWIRE_MAX_SESSIONS` | `20000` | Hard cap on reconstructed conversations; the number dropped is reported in `coverage`. |
 | `GHOSTWIRE_PYTHON_BIN` | `.venv/bin/python3` | Interpreter the server shells out to. |
 | `PORT` | `3001` | API server port. |
 
@@ -157,7 +161,26 @@ Uses the official `ja4plus` library for TLS/TCP/HTTP/SSH fingerprinting:
 - **JA4H** — HTTP client fingerprint, via `ja4plus.generate_ja4h`
 - **JA4SSH** — SSH client fingerprint, via `ja4plus.generate_ja4ssh`
 
-When `ja4plus` is unavailable, JA4H/JA4SSH fall back to clearly-marked `local_` hashes and JA3 falls back to a spec-compliant 5-field hash (TLSVersion, Ciphers, Extensions, EllipticCurves, ECPointFormats). Matches against known C2 tool indicators for Cobalt Strike, Sliver, Metasploit, and more.
+JA3 is always computed from the parsed ClientHello as
+`MD5(TLSVersion,Ciphers,Extensions,EllipticCurves,ECPointFormats)` with `-`
+inside each list and `,` between the five fields (the published algorithm).
+The producing revision is recorded in every result as
+`run.versions.ja3_algorithm`; values written by 0.2.x used comma delimiters
+everywhere and are labelled `ghostwire-ja3-comma-v0.2`. Do not compare a
+historical digest with a current one.
+
+The conformance check is not the project's own fixture (one cipher, one
+extension cannot reveal a delimiter bug). It replays the TCP payloads of
+Wireshark's `test/captures/tls13-rfc8446.pcap`, pinned by commit
+`62874e37` and SHA-256 in `tests/fixtures/wireshark_tls13_rfc8446.json`, and
+asserts the published reference digests
+`25bd5fc6fcc031c1c87f93613e0252ce` (frame 1) and
+`7ed44a80eb19c620609c3b5cbc2eafd0` (frame 7). The check is offline; refresh
+the fixture with `python tests/fixtures/fetch_wireshark_tls13.py`.
+
+Matches against known C2 tool indicators for Cobalt Strike, Sliver,
+Metasploit, and more. A rule match is a match on an observed field — it is
+reported as an inference, not as confirmation that a host is compromised.
 
 > **Note on JA4X (X.509 certificate fingerprinting):** `ja4plus` ships a `generate_ja4x` API; GHOSTWIRE does not yet wire it. It is on the roadmap, not in the current build.
 
@@ -174,6 +197,53 @@ When `ja4plus` is unavailable, JA4H/JA4SSH fall back to clearly-marked `local_` 
 | `dashboard/` | Optional Vite + React hunting dashboard |
 | `tests/` | Self-contained suite (scapy-generated PCAP fixtures — runs on a fresh clone) |
 
+## Evidence, coverage and result schema (0.3.0)
+
+Every analysis writes one versioned result (`schema_version: "1.0"`) that
+answers four questions. `analyze --output json`, the API job result, the
+reports and the dashboard all read this one object.
+
+- **Which capture and frames?** `run.capture` holds the SHA-256, declared link
+  type, the parser that actually produced the records (including a dpkt→scapy
+  fallback), frames read/decoded, and the observed time bounds.
+  `observations[].frame` is a one-based frame number.
+- **Which field?** `observations[].field` (`dns.query_name`,
+  `http.header.user-agent`, `tls.client_hello.ja3`, ...) with `value` exactly as
+  observed and `normalized_value` when a rule compared a normalised form.
+  Stream-derived observations also carry the sequence ranges, gaps and the
+  evidence for the client/server role.
+- **Which rule?** `findings[].rule` (id, revision, source file) plus
+  `findings[].reasons[]`, each naming the observation and the score it
+  contributed on a named scale.
+- **What was unavailable?** `coverage.status` is one of `complete`, `partial`,
+  `unsupported_decode` or `empty`, with reasons. `unsupported_decode` means
+  frames were read and none decoded — a zero finding count there is *not* an
+  all-clear. `partial` means frames or stream bytes were lost.
+
+Three outcomes that used to look identical are now distinct: a complete
+analysis with no rule match, a result filtered by the session threshold (the
+findings are still listed; `selection.explanation` says so), and a partial or
+unsupported decode.
+
+**Counting units.** `packets_total` counts frames; `protocol_counts` is frames
+per decoded protocol (one denominator); `sessions_total` counts reconstructed
+5-tuples; a *finding* is one rule interpretation of one observed subject; a
+*conversation row* is a scored session and is the only thing `--min-score`
+filters. DNS findings are standalone — a DNS query has no TCP session, so it is
+reported with its own frame reference and is never attributed to a TCP session
+because of a shared address or timestamp.
+
+**Export policy (STIX 2.1).** An indicator is raised only for the subject a rule
+matched: the DNS name, or the HTTP request header value (patterned on
+`network-traffic:extensions.'http-request-ext'`). Every indicator carries
+`x_ghostwire_provenance` (capture digest, frames, rule, reasons). Addresses are
+exported as SCOs inside `observed-data` — conversation context, not indicators;
+an indicator decision needs its own basis. Findings with no standard STIX
+patterning target (TLS/SSH fingerprints) are exported as
+`x-ghostwire-finding` with an explicit `export_disposition` rather than forced
+into an invalid pattern. `validate_bundle` checks format; `import_bundle`
+checks meaning.
+
 ## Testing
 
 ```bash
@@ -181,22 +251,36 @@ pip install -e ".[dev]"
 ruff check engine/ tests/
 mypy engine
 python -m pytest -q
+
+# server + dashboard (Node 22 is required for better-sqlite3 prebuilds)
+npm install && npm test
+cd dashboard && npm run test && npm run build
 ```
 
-The test suite synthesizes its own PCAPs (beacon, TLS-with-SNI, DNS-tunnel, CS-UA HTTP) in `tests/conftest.py` via scapy, so it runs on a fresh clone with no binary fixtures committed.
+The test suite synthesizes its own PCAPs (beacon, TLS-with-SNI, DNS-tunnel, CS-UA HTTP, split/truncated/reversed ClientHellos, duplicate segments, a server-first excerpt) in `tests/conftest.py` via scapy, so it runs on a fresh clone with no binary capture committed. The one external reference is reduced to the TCP payload bytes of Wireshark's TLS 1.3 capture, with attribution and a refresh script (see above).
+
+`server/e2e.test.ts` runs a real capture through the real Python engine and the Fastify job store, then compares the API result with the CLI. It skips (with a reason) when `.venv` is absent, so a Node-only checkout still runs `npm test`.
 
 ## Why GHOSTWIRE?
 
-| Feature | RITA | Malcolm | Arkime | GHOSTWIRE |
-|---------|------|---------|--------|-----------|
-| C2 beacon detection | ✅ | ❌ | ❌ | ✅ |
-| JA4+ fingerprinting | ❌ | ❌ | ❌ | ✅ |
-| Single developer built | ❌ | ❌ | ❌ | ✅ |
-| No infrastructure needed | ❌ | ❌ | ❌ | ✅ |
-| PCAP-level analysis | ❌* | ✅ | ✅ | ✅ |
-| DNS threat detection | ❌ | ❌ | ❌ | ✅ |
+The table records **documented capabilities as of 2026-11**, from each project's
+public documentation. It is not a benchmark: no capture was run through the
+other tools for this repository, and capability presence says nothing about
+accuracy, scale or operational maturity. Every ✅ for GHOSTWIRE is covered by a
+test in this repo; every ❌ for another tool is "not documented as a built-in",
+not "cannot be built".
 
-*RITA analyzes Zeek/Zeek logs (not raw PCAP directly), which is the real differentiator.
+| Capability | RITA | Malcolm | Arkime | GHOSTWIRE |
+|---------|------|---------|--------|-----------|
+| Built-in C2 beacon scoring | ✅ | ❌ | ❌ | ✅ |
+| JA4/JA4H/JA4SSH fingerprinting | ❌ | ❌ | ❌ | ✅ |
+| Reads raw PCAP directly | ❌ (Zeek logs) | ✅ | ✅ | ✅ |
+| Built-in DNS tunneling heuristic | ❌ | ❌ | ❌ | ✅ |
+| Single-process, no infrastructure | ❌ | ❌ | ❌ | ✅ |
+
+What this table does **not** establish: detection accuracy, false-positive
+rate, throughput, or fitness for a production SOC. GHOSTWIRE is a beta
+workbench; its accuracy on held-out traffic has not been measured.
 
 ## Roadmap
 
@@ -213,6 +297,8 @@ The test suite synthesizes its own PCAPs (beacon, TLS-with-SNI, DNS-tunnel, CS-U
 - [x] DNS compression-pointer handling + strict DNS validation (reject non-DNS UDP, fail-closed on garbage qtypes/labels) — v0.2.0
 - [x] NetBIOS Name Service (NBNS/UDP 137) suppression — fixed 32-char A-P encoded names no longer flag as DNS tunneling — v0.2.0
 - [x] Dashboard auth boundary inversion + operator-entered API key (no secret baked into the JS bundle; `/api/*` and `/ws` gated, dashboard shell public) — v0.2.1
+- [x] Wave 1 evidence contract: observations, findings, coverage states, selection counters, saved-job compatibility, reanalysis — v0.3.0
+- [x] JA3 conformance against Wireshark's TLS 1.3 reference capture; historical digests labelled by algorithm revision — v0.3.0
 - [ ] JA4X (X.509 certificate fingerprinting)
 - [ ] Runtime C2 feed fetch (currently bundled / local-dir only)
 - [ ] Multi-worker rate limiting (Redis; per-process today)
